@@ -33,6 +33,18 @@ def read_records(handle: TextIO) -> Iterator[FastqRecord]:
         yield header, seq, plus, qual
 
 
+def read_id(header: str) -> str:
+    """Return a normalized read ID without common paired-end suffixes."""
+    token = header.strip().split()[0]
+    if not token.startswith("@"):
+        raise ValueError(f"Malformed FASTQ header: {header.strip()}")
+    token = token[1:]
+    for suffix in ("/1", "/2"):
+        if token.endswith(suffix):
+            token = token[: -len(suffix)]
+    return token
+
+
 def write_record(handle: gzip.GzipFile, record: FastqRecord) -> None:
     for field in record:
         handle.write(field.encode("utf-8"))
@@ -94,6 +106,13 @@ def main() -> int:
                     r2_record = next(r2_records)
                 except StopIteration as exc:
                     raise ValueError("R1 contains more records than R2") from exc
+
+                r1_id = read_id(r1_record[0])
+                r2_id = read_id(r2_record[0])
+                if r1_id != r2_id:
+                    raise ValueError(
+                        f"Read ID mismatch at pair {total_pairs + 1}: R1={r1_id} R2={r2_id}"
+                    )
 
                 if pairs_in_chunk == 0:
                     chunk_index += 1

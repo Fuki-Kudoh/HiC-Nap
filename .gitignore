@@ -1,0 +1,32 @@
+# Raw sequencing inputs and common intermediate data
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.sam
+*.bam
+*.cram
+*.pairsam
+*.pairsam.gz
+*.pairs
+*.pairs.gz
+*.cool
+*.mcool
+*.hic
+
+# Pipeline runtime outputs
+fastqc/
+logs/
+genome/
+status/
+chunks/
+work/
+tmp/
+*.status
+*.lock
+*.tmp
+
+# Python/runtime noise
+__pycache__/
+*.py[cod]
+.DS_Store
