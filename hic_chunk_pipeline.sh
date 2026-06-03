@@ -22,6 +22,7 @@ SPLIT_HELPER="${SCRIPT_DIR}/split_pe_fastq.py"
 CURRENT_STATUS_FILE=""
 LOCK_FD=9
 LOCK_DIR=""
+LOCK_HELD=0
 REF_LOCK_FD=8
 REF_LOCK_DIR=""
 REF_LOCK_HELD=0
@@ -63,7 +64,7 @@ log_msg() {
 
 die() {
   log_msg "ERROR: $*"
-  if [[ -n "${PIPELINE_STATUS:-}" && -f "${PIPELINE_STATUS}" ]]; then
+  if [[ "$LOCK_HELD" -eq 1 && -n "${PIPELINE_STATUS:-}" && -f "${PIPELINE_STATUS}" ]]; then
     atomic_set_status "$PIPELINE_STATUS" "failed" || true
   fi
   exit 1
@@ -75,7 +76,7 @@ on_error() {
   if [[ -n "${CURRENT_STATUS_FILE}" && -f "${CURRENT_STATUS_FILE}" ]]; then
     atomic_set_status "$CURRENT_STATUS_FILE" "failed" || true
   fi
-  if [[ -n "${PIPELINE_STATUS:-}" && -f "${PIPELINE_STATUS}" ]]; then
+  if [[ "$LOCK_HELD" -eq 1 && -n "${PIPELINE_STATUS:-}" && -f "${PIPELINE_STATUS}" ]]; then
     atomic_set_status "$PIPELINE_STATUS" "failed" || true
   fi
   log_msg "Pipeline failed at line ${line_no} with exit code ${exit_code}"
@@ -86,7 +87,7 @@ on_interrupt() {
   if [[ -n "${CURRENT_STATUS_FILE}" && -f "${CURRENT_STATUS_FILE}" ]]; then
     atomic_set_status "$CURRENT_STATUS_FILE" "failed" || true
   fi
-  if [[ -n "${PIPELINE_STATUS:-}" && -f "${PIPELINE_STATUS}" ]]; then
+  if [[ "$LOCK_HELD" -eq 1 && -n "${PIPELINE_STATUS:-}" && -f "${PIPELINE_STATUS}" ]]; then
     atomic_set_status "$PIPELINE_STATUS" "failed" || true
   fi
   log_msg "Interrupted; current step was not marked done"
@@ -808,11 +809,13 @@ acquire_lock() {
   if command -v flock >/dev/null 2>&1; then
     eval "exec ${LOCK_FD}>\"${lock_file}\""
     flock -n "$LOCK_FD" || die "Another pipeline instance is already processing sample ${SAMPLE}"
+    LOCK_HELD=1
   else
     LOCK_DIR="${lock_file}.d"
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
       die "Another pipeline instance may be processing sample ${SAMPLE}; lock exists: ${LOCK_DIR}"
     fi
+    LOCK_HELD=1
   fi
 }
 
@@ -821,13 +824,14 @@ acquire_reference_lock() {
   local lock_file="${GENOME_DIR}/.locks/${GENOME_NAME}.${ENZYME}.reference.lock"
   if command -v flock >/dev/null 2>&1; then
     eval "exec ${REF_LOCK_FD}>\"${lock_file}\""
-    flock -n "$REF_LOCK_FD" || die "Another pipeline instance is preparing reference files for ${GENOME_NAME}/${ENZYME}"
+    flock "$REF_LOCK_FD" || die "Could not acquire reference lock for ${GENOME_NAME}/${ENZYME}"
     REF_LOCK_HELD=1
   else
     REF_LOCK_DIR="${lock_file}.d"
-    if ! mkdir "$REF_LOCK_DIR" 2>/dev/null; then
-      die "Another pipeline instance may be preparing reference files; lock exists: ${REF_LOCK_DIR}"
-    fi
+    while ! mkdir "$REF_LOCK_DIR" 2>/dev/null; do
+      log_msg "Waiting for reference lock: ${REF_LOCK_DIR}"
+      sleep 10
+    done
     REF_LOCK_HELD=1
   fi
 }
@@ -850,6 +854,7 @@ cleanup_lock() {
   if [[ -n "${LOCK_DIR:-}" && -d "$LOCK_DIR" ]]; then
     rm -rf "$LOCK_DIR"
   fi
+  LOCK_HELD=0
   release_reference_lock
 }
 
@@ -907,12 +912,12 @@ main() {
   trap on_error ERR
   trap on_interrupt INT TERM
   trap cleanup_lock EXIT
-  acquire_lock
-  init_status
   if [[ "$STATUS_ONLY" -eq 1 ]]; then
     print_status
     exit 0
   fi
+  acquire_lock
+  init_status
   preflight
   atomic_set_status "$PIPELINE_STATUS" "running"
   prepare_reference
