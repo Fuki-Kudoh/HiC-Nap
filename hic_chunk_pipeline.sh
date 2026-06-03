@@ -22,6 +22,9 @@ SPLIT_HELPER="${SCRIPT_DIR}/split_pe_fastq.py"
 CURRENT_STATUS_FILE=""
 LOCK_FD=9
 LOCK_DIR=""
+REF_LOCK_FD=8
+REF_LOCK_DIR=""
+REF_LOCK_HELD=0
 
 usage() {
   cat <<'EOF'
@@ -60,6 +63,9 @@ log_msg() {
 
 die() {
   log_msg "ERROR: $*"
+  if [[ -n "${PIPELINE_STATUS:-}" && -f "${PIPELINE_STATUS}" ]]; then
+    atomic_set_status "$PIPELINE_STATUS" "failed" || true
+  fi
   exit 1
 }
 
@@ -69,6 +75,9 @@ on_error() {
   if [[ -n "${CURRENT_STATUS_FILE}" && -f "${CURRENT_STATUS_FILE}" ]]; then
     atomic_set_status "$CURRENT_STATUS_FILE" "failed" || true
   fi
+  if [[ -n "${PIPELINE_STATUS:-}" && -f "${PIPELINE_STATUS}" ]]; then
+    atomic_set_status "$PIPELINE_STATUS" "failed" || true
+  fi
   log_msg "Pipeline failed at line ${line_no} with exit code ${exit_code}"
   exit "$exit_code"
 }
@@ -76,6 +85,9 @@ on_error() {
 on_interrupt() {
   if [[ -n "${CURRENT_STATUS_FILE}" && -f "${CURRENT_STATUS_FILE}" ]]; then
     atomic_set_status "$CURRENT_STATUS_FILE" "failed" || true
+  fi
+  if [[ -n "${PIPELINE_STATUS:-}" && -f "${PIPELINE_STATUS}" ]]; then
+    atomic_set_status "$PIPELINE_STATUS" "failed" || true
   fi
   log_msg "Interrupted; current step was not marked done"
   exit 130
@@ -167,9 +179,18 @@ validate_pairsam_gz() {
   local path="$1"
   [[ -s "$path" ]] || return 1
   validate_gzip "$path" || return 1
-  local first_line
-  first_line="$(gzip -cd "$path" | awk 'NR == 1 { first = $0 } END { print first }')"
-  [[ -n "$first_line" ]]
+  gzip -cd "$path" | awk '
+    BEGIN { pairs_format = 0; columns = 0 }
+    /^## pairs format/ { pairs_format = 1 }
+    /^#columns:/ {
+      if ($0 ~ /readID/ && $0 ~ /chrom1/ && $0 ~ /pos1/ &&
+          $0 ~ /chrom2/ && $0 ~ /pos2/ && $0 ~ /strand1/ &&
+          $0 ~ /strand2/ && $0 ~ /pair_type/) {
+        columns = 1
+      }
+    }
+    END { exit ! (pairs_format && columns) }
+  '
 }
 
 validate_sam() {
@@ -193,6 +214,8 @@ prepare_dirs() {
   LOG_DIR="${OUTDIR}/logs/${SAMPLE}"
   CHUNK_LOG_DIR="${LOG_DIR}/chunks"
   GENOME_DIR="${OUTDIR}/genome"
+  STATUS_ROOT="${OUTDIR}/status"
+  LOCK_ROOT="${STATUS_ROOT}/.locks"
   STATUS_DIR="${OUTDIR}/status/${SAMPLE}"
   CHUNK_STATUS_ROOT="${STATUS_DIR}/chunks"
   CHUNK_FASTQ_DIR="${OUTDIR}/chunks/${SAMPLE}/fastq"
@@ -207,12 +230,13 @@ prepare_dirs() {
   ALL_CHUNKS_STATUS="${STATUS_DIR}/all_chunks.status"
   FINAL_STATUS="${STATUS_DIR}/final.status"
   CHUNKS_TSV="${STATUS_DIR}/chunks.tsv"
-  mkdir -p "$FASTQC_DIR" "$LOG_DIR" "$CHUNK_LOG_DIR" "$GENOME_DIR" "$STATUS_DIR" \
+  mkdir -p "$FASTQC_DIR" "$LOG_DIR" "$CHUNK_LOG_DIR" "$GENOME_DIR" "$LOCK_ROOT" "$STATUS_DIR" \
     "$CHUNK_STATUS_ROOT" "$CHUNK_FASTQ_DIR" "$CHUNK_PROCESSED_ROOT" \
     "$SAMPLE_TMPDIR" "$SAMPLE_WORK_CHUNKS"
 }
 
 prepare_reference() {
+  acquire_reference_lock
   log_msg "Preparing reference files if missing"
   local chrom_sizes="${GENOME_DIR}/${GENOME_NAME}.chrom.sizes"
   local frags_bed="${GENOME_DIR}/${GENOME_NAME}.${ENZYME}.frags.bed"
@@ -239,6 +263,7 @@ prepare_reference() {
     log_msg "BWA index missing; running bwa index for ${GENOME_FA}"
     bwa index "$GENOME_FA" >> "$GLOBAL_LOG" 2>&1
   fi
+  release_reference_lock
 }
 
 write_step_log_header() {
@@ -362,8 +387,6 @@ chunk_paths() {
   CHUNK_PROCESSED_DIR="${CHUNK_PROCESSED_ROOT}/${chunk_id}"
   CHUNK_WORK_DIR="${SAMPLE_WORK_CHUNKS}/${chunk_id}"
   TRIM_DIR="${CHUNK_PROCESSED_DIR}/trim"
-  ALIGN_DIR="${CHUNK_PROCESSED_DIR}/align"
-  PAIRS_DIR="${CHUNK_PROCESSED_DIR}/pairs"
   TRIM_R1="${TRIM_DIR}/${chunk_id}_val_1.fq.gz"
   TRIM_R2="${TRIM_DIR}/${chunk_id}_val_2.fq.gz"
   SAM_FILE="${CHUNK_WORK_DIR}/${chunk_id}.sam"
@@ -372,7 +395,7 @@ chunk_paths() {
   SORTED_FILE="${CHUNK_WORK_DIR}/${chunk_id}.sorted.pairsam.gz"
   RESTRICTED_FILE="${CHUNK_WORK_DIR}/${chunk_id}.restricted.pairsam.gz"
   SELECTED_FILE="${CHUNK_PROCESSED_DIR}/chunk.selected.sorted.pairsam.gz"
-  mkdir -p "$CHUNK_PROCESSED_DIR" "$CHUNK_WORK_DIR" "$TRIM_DIR" "$ALIGN_DIR" "$PAIRS_DIR"
+  mkdir -p "$CHUNK_PROCESSED_DIR" "$CHUNK_WORK_DIR" "$TRIM_DIR"
 }
 
 chunk_status_file() {
@@ -780,7 +803,8 @@ EOF
 }
 
 acquire_lock() {
-  local lock_file="${STATUS_DIR}/pipeline.lock"
+  mkdir -p "$LOCK_ROOT"
+  local lock_file="${LOCK_ROOT}/${SAMPLE}.lock"
   if command -v flock >/dev/null 2>&1; then
     eval "exec ${LOCK_FD}>\"${lock_file}\""
     flock -n "$LOCK_FD" || die "Another pipeline instance is already processing sample ${SAMPLE}"
@@ -792,10 +816,41 @@ acquire_lock() {
   fi
 }
 
+acquire_reference_lock() {
+  mkdir -p "${GENOME_DIR}/.locks"
+  local lock_file="${GENOME_DIR}/.locks/${GENOME_NAME}.${ENZYME}.reference.lock"
+  if command -v flock >/dev/null 2>&1; then
+    eval "exec ${REF_LOCK_FD}>\"${lock_file}\""
+    flock -n "$REF_LOCK_FD" || die "Another pipeline instance is preparing reference files for ${GENOME_NAME}/${ENZYME}"
+    REF_LOCK_HELD=1
+  else
+    REF_LOCK_DIR="${lock_file}.d"
+    if ! mkdir "$REF_LOCK_DIR" 2>/dev/null; then
+      die "Another pipeline instance may be preparing reference files; lock exists: ${REF_LOCK_DIR}"
+    fi
+    REF_LOCK_HELD=1
+  fi
+}
+
+release_reference_lock() {
+  if [[ "$REF_LOCK_HELD" -ne 1 ]]; then
+    return
+  fi
+  if command -v flock >/dev/null 2>&1; then
+    flock -u "$REF_LOCK_FD" || true
+  fi
+  if [[ -n "${REF_LOCK_DIR:-}" && -d "$REF_LOCK_DIR" ]]; then
+    rm -rf "$REF_LOCK_DIR"
+    REF_LOCK_DIR=""
+  fi
+  REF_LOCK_HELD=0
+}
+
 cleanup_lock() {
   if [[ -n "${LOCK_DIR:-}" && -d "$LOCK_DIR" ]]; then
     rm -rf "$LOCK_DIR"
   fi
+  release_reference_lock
 }
 
 preflight() {
@@ -808,7 +863,6 @@ preflight() {
   require_command samtools
   require_command pairtools
   require_command cooler
-  require_command bgzip
   require_command gzip
   require_command python3
   [[ -s "$SPLIT_HELPER" ]] || die "FASTQ split helper not found: ${SPLIT_HELPER}"
@@ -853,12 +907,12 @@ main() {
   trap on_error ERR
   trap on_interrupt INT TERM
   trap cleanup_lock EXIT
+  acquire_lock
   init_status
   if [[ "$STATUS_ONLY" -eq 1 ]]; then
     print_status
     exit 0
   fi
-  acquire_lock
   preflight
   atomic_set_status "$PIPELINE_STATUS" "running"
   prepare_reference
@@ -868,7 +922,8 @@ main() {
   if check_all_chunks_done; then
     log_msg "Pipeline complete for sample ${SAMPLE}"
   else
-    log_msg "Pipeline stopped with incomplete chunks; final status not set"
+    atomic_set_status "$PIPELINE_STATUS" "null"
+    log_msg "Pipeline stopped cleanly with incomplete chunks; pipeline status reset to null"
   fi
 }
 
