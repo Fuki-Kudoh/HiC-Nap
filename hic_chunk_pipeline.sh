@@ -26,6 +26,8 @@ LOCK_HELD=0
 REF_LOCK_FD=8
 REF_LOCK_DIR=""
 REF_LOCK_HELD=0
+CURRENT_CHUNK_INDEX=0
+CURRENT_CHUNK_TOTAL=0
 
 usage() {
   cat <<'EOF'
@@ -62,11 +64,27 @@ log_msg() {
   fi
 }
 
+progress_msg() {
+  local message="[HiC-Nap] $1"
+  if [[ -n "${GLOBAL_LOG:-}" ]]; then
+    printf '%s\n' "$message" | tee -a "$GLOBAL_LOG" >&2
+  else
+    printf '%s\n' "$message" >&2
+  fi
+}
+
+chunk_progress_msg() {
+  local chunk_id="$1"
+  local step_message="$2"
+  progress_msg "chunk ${CURRENT_CHUNK_INDEX}/${CURRENT_CHUNK_TOTAL} ${chunk_id}: ${step_message}"
+}
+
 die() {
   log_msg "ERROR: $*"
   if [[ "$LOCK_HELD" -eq 1 && -n "${PIPELINE_STATUS:-}" && -f "${PIPELINE_STATUS}" ]]; then
     atomic_set_status "$PIPELINE_STATUS" "failed" || true
   fi
+  print_final_summary || true
   exit 1
 }
 
@@ -80,6 +98,7 @@ on_error() {
     atomic_set_status "$PIPELINE_STATUS" "failed" || true
   fi
   log_msg "Pipeline failed at line ${line_no} with exit code ${exit_code}"
+  print_final_summary || true
   exit "$exit_code"
 }
 
@@ -91,6 +110,7 @@ on_interrupt() {
     atomic_set_status "$PIPELINE_STATUS" "failed" || true
   fi
   log_msg "Interrupted; current step was not marked done"
+  print_final_summary || true
   exit 130
 }
 
@@ -350,10 +370,103 @@ validate_chunks_manifest() {
   done < "$CHUNKS_TSV"
 }
 
+chunk_total_count() {
+  if [[ ! -s "${CHUNKS_TSV:-}" ]]; then
+    printf '0\n'
+    return
+  fi
+  tail -n +2 "$CHUNKS_TSV" | awk 'END { print NR + 0 }'
+}
+
+chunk_total_read_pairs() {
+  if [[ ! -s "${CHUNKS_TSV:-}" ]]; then
+    printf 'unknown\n'
+    return
+  fi
+  awk -F '\t' '
+    NR == 1 { next }
+    $4 !~ /^[0-9]+$/ { available = 0; exit }
+    { total += $4; available = 1 }
+    END {
+      if (available) {
+        print total + 0
+      } else {
+        print "unknown"
+      }
+    }
+  ' "$CHUNKS_TSV"
+}
+
+completed_chunk_count() {
+  if [[ ! -s "${CHUNKS_TSV:-}" ]]; then
+    printf '0\n'
+    return
+  fi
+  local done_count=0
+  local chunk_id chunk_r1 chunk_r2 n_read_pairs
+  while IFS=$'\t' read -r chunk_id chunk_r1 chunk_r2 n_read_pairs; do
+    [[ "$chunk_id" == "chunk_id" ]] && continue
+    [[ -n "$chunk_id" ]] || continue
+    if [[ "$(get_status "$(chunk_status_file "$chunk_id" chunk)")" == "done" ]]; then
+      done_count=$((done_count + 1))
+    fi
+  done < "$CHUNKS_TSV"
+  printf '%s\n' "$done_count"
+}
+
+print_run_summary() {
+  progress_msg "run summary:"
+  progress_msg "  sample: ${SAMPLE}"
+  progress_msg "  input R1: ${R1}"
+  progress_msg "  input R2: ${R2}"
+  progress_msg "  genome name: ${GENOME_NAME}"
+  progress_msg "  enzyme: ${ENZYME}"
+  progress_msg "  threads: ${THREADS}"
+  progress_msg "  chunk size: ${CHUNK_SIZE}"
+  progress_msg "  max chunks: ${MAX_CHUNKS}"
+  progress_msg "  workdir: ${WORKDIR}"
+  progress_msg "  outdir: ${OUTDIR}"
+}
+
+print_chunk_split_summary() {
+  local total_chunks total_pairs
+  total_chunks="$(chunk_total_count)"
+  total_pairs="$(chunk_total_read_pairs)"
+  progress_msg "chunk splitting complete:"
+  progress_msg "  total chunks: ${total_chunks}"
+  progress_msg "  total read pairs: ${total_pairs}"
+  progress_msg "  chunk size: ${CHUNK_SIZE}"
+}
+
+print_max_chunks_summary() {
+  local processed_this_run="$1"
+  local total_chunks completed_chunks
+  total_chunks="$(chunk_total_count)"
+  completed_chunks="$(completed_chunk_count)"
+  progress_msg "processed ${processed_this_run} chunk(s) this run; ${completed_chunks}/${total_chunks} total chunks complete"
+}
+
+print_final_summary() {
+  [[ -n "${STATUS_DIR:-}" ]] || return 0
+  local total_chunks completed_chunks incomplete_chunks pipeline_status
+  total_chunks="$(chunk_total_count)"
+  completed_chunks="$(completed_chunk_count)"
+  incomplete_chunks=$((total_chunks - completed_chunks))
+  pipeline_status="$(get_status "${PIPELINE_STATUS:-}")"
+  progress_msg "final summary:"
+  progress_msg "  total chunks: ${total_chunks}"
+  progress_msg "  completed chunks: ${completed_chunks}"
+  progress_msg "  incomplete chunks: ${incomplete_chunks}"
+  progress_msg "  final pipeline.status: ${pipeline_status}"
+  progress_msg "  status directory: ${STATUS_DIR}"
+  progress_msg "  logs directory: ${LOG_DIR}"
+}
+
 split_fastq_chunks() {
   if [[ "$(get_status "$CHUNK_SPLIT_STATUS")" == "done" ]] && validate_chunks_manifest; then
     log_msg "FASTQ chunks already complete"
     init_chunk_statuses
+    print_chunk_split_summary
     return
   fi
   log_msg "Splitting paired FASTQ files into chunks"
@@ -377,6 +490,7 @@ split_fastq_chunks() {
   if [[ "$exit_code" -eq 0 ]] && validate_chunks_manifest; then
     init_chunk_statuses
     atomic_set_status "$CHUNK_SPLIT_STATUS" "done"
+    print_chunk_split_summary
   else
     atomic_set_status "$CHUNK_SPLIT_STATUS" "failed"
     die "FASTQ chunk splitting failed"
@@ -506,6 +620,7 @@ run_trim_galore_step() {
   local chunk_r1="$2"
   local chunk_r2="$3"
   step_complete_or_reset "$chunk_id" "trim_galore" && return
+  chunk_progress_msg "$chunk_id" "trim_galore"
   local status_file log_file cmd_text
   status_file="$(chunk_status_file "$chunk_id" trim_galore)"
   log_file="${CHUNK_LOG_DIR}/${chunk_id}.trim_galore.log"
@@ -533,6 +648,7 @@ run_bwa_mem_step() {
     return
   fi
   step_complete_or_reset "$chunk_id" "bwa_mem" && return
+  chunk_progress_msg "$chunk_id" "bwa_mem"
   local status_file log_file cmd_text
   status_file="$(chunk_status_file "$chunk_id" bwa_mem)"
   log_file="${CHUNK_LOG_DIR}/${chunk_id}.bwa_mem.log"
@@ -569,6 +685,7 @@ run_parse_step() {
     atomic_set_status "$(chunk_status_file "$chunk_id" bwa_mem)" "null"
     run_bwa_mem_step "$chunk_id"
   fi
+  chunk_progress_msg "$chunk_id" "parse"
   local status_file log_file cmd_text stats_file
   status_file="$(chunk_status_file "$chunk_id" parse)"
   log_file="${CHUNK_LOG_DIR}/${chunk_id}.parse.log"
@@ -602,6 +719,7 @@ run_sort_step() {
     return
   fi
   step_complete_or_reset "$chunk_id" "sort" && { rm -f "$PARSED_FILE"; return; }
+  chunk_progress_msg "$chunk_id" "sort"
   local status_file log_file cmd_text
   status_file="$(chunk_status_file "$chunk_id" sort)"
   log_file="${CHUNK_LOG_DIR}/${chunk_id}.sort.log"
@@ -631,6 +749,7 @@ run_restrict_step() {
     return
   fi
   step_complete_or_reset "$chunk_id" "restrict" && { rm -f "$SORTED_FILE"; return; }
+  chunk_progress_msg "$chunk_id" "restrict"
   local status_file log_file cmd_text frags_bed
   status_file="$(chunk_status_file "$chunk_id" restrict)"
   log_file="${CHUNK_LOG_DIR}/${chunk_id}.restrict.log"
@@ -657,6 +776,7 @@ run_restrict_step() {
 run_select_step() {
   local chunk_id="$1"
   step_complete_or_reset "$chunk_id" "select" && { rm -f "$RESTRICTED_FILE"; return; }
+  chunk_progress_msg "$chunk_id" "select"
   local status_file log_file cmd_text expr
   status_file="$(chunk_status_file "$chunk_id" select)"
   log_file="${CHUNK_LOG_DIR}/${chunk_id}.select.log"
@@ -684,11 +804,15 @@ process_chunk() {
   local chunk_id="$1"
   local chunk_r1="$2"
   local chunk_r2="$3"
+  local chunk_index="$4"
+  local total_chunks="$5"
+  CURRENT_CHUNK_INDEX="$chunk_index"
+  CURRENT_CHUNK_TOTAL="$total_chunks"
   chunk_paths "$chunk_id"
   local chunk_status
   chunk_status="$(chunk_status_file "$chunk_id" chunk)"
   if [[ "$(get_status "$chunk_status")" == "done" ]] && validate_pairsam_gz "$SELECTED_FILE"; then
-    log_msg "${chunk_id}: already complete"
+    chunk_progress_msg "$chunk_id" "already complete, skipping"
     return
   fi
   atomic_set_status "$chunk_status" "null"
@@ -702,6 +826,7 @@ process_chunk() {
   if [[ "$(get_status "$(chunk_status_file "$chunk_id" select)")" == "done" ]] && validate_pairsam_gz "$SELECTED_FILE"; then
     atomic_set_status "$chunk_status" "done"
     log_msg "${chunk_id}: complete"
+    chunk_progress_msg "$chunk_id" "done"
   else
     atomic_set_status "$chunk_status" "null"
     die "${chunk_id}: final chunk validation failed"
@@ -710,21 +835,31 @@ process_chunk() {
 
 process_all_chunks() {
   local processed_this_run=0
+  local total_chunks chunk_index=0
+  total_chunks="$(chunk_total_count)"
   local chunk_id chunk_r1 chunk_r2 n_read_pairs
   while IFS=$'\t' read -r chunk_id chunk_r1 chunk_r2 n_read_pairs; do
     [[ "$chunk_id" == "chunk_id" ]] && continue
     [[ -n "$chunk_id" ]] || continue
+    chunk_index=$((chunk_index + 1))
+    CURRENT_CHUNK_INDEX="$chunk_index"
+    CURRENT_CHUNK_TOTAL="$total_chunks"
     chunk_paths "$chunk_id"
     if [[ "$(get_status "$(chunk_status_file "$chunk_id" chunk)")" == "done" ]] && validate_pairsam_gz "$SELECTED_FILE"; then
+      chunk_progress_msg "$chunk_id" "already complete, skipping"
       continue
     fi
     if [[ "$MAX_CHUNKS" -gt 0 && "$processed_this_run" -ge "$MAX_CHUNKS" ]]; then
       log_msg "Reached --max-chunks ${MAX_CHUNKS}; exiting cleanly"
+      print_max_chunks_summary "$processed_this_run"
       return
     fi
-    process_chunk "$chunk_id" "$chunk_r1" "$chunk_r2"
+    process_chunk "$chunk_id" "$chunk_r1" "$chunk_r2" "$chunk_index" "$total_chunks"
     processed_this_run=$((processed_this_run + 1))
   done < "$CHUNKS_TSV"
+  if [[ "$MAX_CHUNKS" -gt 0 ]]; then
+    print_max_chunks_summary "$processed_this_run"
+  fi
 }
 
 check_all_chunks_done() {
@@ -780,6 +915,10 @@ print_status() {
       [[ "$(get_status "$(chunk_status_file "$chunk_id" select)")" == "done" ]] || select_incomplete=$((select_incomplete + 1))
     done < "$CHUNKS_TSV"
   fi
+  local percent_complete="0.0"
+  if [[ "$total" -gt 0 ]]; then
+    percent_complete="$(awk -v done="$done_count" -v total="$total" 'BEGIN { printf "%.1f", (done / total) * 100 }')"
+  fi
   cat <<EOF
 Sample: ${SAMPLE}
 Pipeline: $(get_status "$PIPELINE_STATUS")
@@ -792,6 +931,7 @@ Chunks:
   total: ${total}
   done: ${done_count}
   incomplete: ${incomplete_count}
+  complete: ${done_count}/${total} (${percent_complete}%)
 
 Per-step incomplete counts:
   trim_galore: ${trim_incomplete}
@@ -918,6 +1058,7 @@ main() {
   fi
   acquire_lock
   init_status
+  print_run_summary
   preflight
   atomic_set_status "$PIPELINE_STATUS" "running"
   prepare_reference
@@ -930,6 +1071,7 @@ main() {
     atomic_set_status "$PIPELINE_STATUS" "null"
     log_msg "Pipeline stopped cleanly with incomplete chunks; pipeline status reset to null"
   fi
+  print_final_summary
 }
 
 main "$@"

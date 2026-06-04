@@ -128,6 +128,46 @@ Use `--max-chunks` to process only a limited number of unfinished chunks in one 
 
 If the script stops cleanly because the chunk limit is reached and chunks remain incomplete, `pipeline.status` is reset to `null`. Errors and interrupts set `pipeline.status` to `failed`.
 
+## Progress Output
+
+The pipeline prints line-based progress messages to stderr and appends them to `outdir/logs/SAMPLE/global.log`, so long runs can be followed from a terminal, tmux pane, SSH session, or redirected job log.
+
+Example output:
+
+```text
+[HiC-Nap] run summary:
+[HiC-Nap]   sample: SAMPLE_ID
+[HiC-Nap]   input R1: /path/to/sample_R1.fastq.gz
+[HiC-Nap]   input R2: /path/to/sample_R2.fastq.gz
+[HiC-Nap]   genome name: mm10
+[HiC-Nap]   enzyme: MboI
+[HiC-Nap]   threads: 14
+[HiC-Nap]   chunk size: 10000000
+[HiC-Nap]   max chunks: 0
+[HiC-Nap]   workdir: /path/to/workdir
+[HiC-Nap]   outdir: /path/to/outdir
+[HiC-Nap] chunk splitting complete:
+[HiC-Nap]   total chunks: 42
+[HiC-Nap]   total read pairs: 420000000
+[HiC-Nap]   chunk size: 10000000
+[HiC-Nap] chunk 3/42 chunk_000003: trim_galore
+[HiC-Nap] chunk 3/42 chunk_000003: bwa_mem
+[HiC-Nap] chunk 3/42 chunk_000003: parse
+[HiC-Nap] chunk 3/42 chunk_000003: sort
+[HiC-Nap] chunk 3/42 chunk_000003: restrict
+[HiC-Nap] chunk 3/42 chunk_000003: select
+[HiC-Nap] chunk 3/42 chunk_000003: done
+[HiC-Nap] chunk 7/42 chunk_000007: already complete, skipping
+[HiC-Nap] processed 2 chunk(s) this run; 7/42 total chunks complete
+[HiC-Nap] final summary:
+[HiC-Nap]   total chunks: 42
+[HiC-Nap]   completed chunks: 7
+[HiC-Nap]   incomplete chunks: 35
+[HiC-Nap]   final pipeline.status: null
+[HiC-Nap]   status directory: /path/to/outdir/status/SAMPLE_ID
+[HiC-Nap]   logs directory: /path/to/outdir/logs/SAMPLE_ID
+```
+
 ## Status Summary
 
 ```bash
