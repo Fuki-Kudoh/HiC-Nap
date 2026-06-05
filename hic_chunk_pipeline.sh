@@ -11,6 +11,7 @@ WORKDIR=""
 OUTDIR=""
 THREADS=14
 CHUNK_SIZE=10000000
+CHUNK_VALIDATE_MODE=light
 MIN_MAPQ=30
 SHORT_CIS_CUTOFF=2000
 MAX_CHUNKS=0
@@ -45,6 +46,7 @@ Usage:
 Optional:
   --threads 14
   --chunk-size 10000000
+  --chunk-validate-mode light|strict
   --min-mapq 30
   --short-cis-cutoff 2000
   --max-chunks 0
@@ -194,6 +196,26 @@ validate_fastq_pair() {
   r1_count="$(count_fastq_reads "$r1_path")" || return 1
   r2_count="$(count_fastq_reads "$r2_path")" || return 1
   [[ "$r1_count" == "$r2_count" ]]
+}
+
+validate_chunk_fastq_light() {
+  local r1_path="$1"
+  local r2_path="$2"
+  [[ -s "$r1_path" && -s "$r2_path" ]] || return 1
+  validate_gzip "$r1_path" || return 1
+  validate_gzip "$r2_path" || return 1
+}
+
+validate_chunk_fastq_strict() {
+  local r1_path="$1"
+  local r2_path="$2"
+  local expected_pairs="$3"
+  validate_chunk_fastq_light "$r1_path" "$r2_path" || return 1
+  local r1_count r2_count
+  r1_count="$(count_fastq_reads "$r1_path")" || return 1
+  r2_count="$(count_fastq_reads "$r2_path")" || return 1
+  [[ "$r1_count" == "$r2_count" ]] || return 1
+  [[ "$r1_count" == "$expected_pairs" ]]
 }
 
 validate_pairsam_gz() {
@@ -356,18 +378,43 @@ init_chunk_statuses() {
 }
 
 validate_chunks_manifest() {
-  [[ -s "$CHUNKS_TSV" ]] || return 1
-  local count
-  count="$(tail -n +2 "$CHUNKS_TSV" | awk 'END { print NR }')"
-  [[ "$count" -gt 0 ]] || return 1
-  local chunk_id r1_path r2_path n_read_pairs observed_pairs
-  while IFS=$'\t' read -r chunk_id r1_path r2_path n_read_pairs; do
-    [[ "$chunk_id" == "chunk_id" ]] && continue
-    [[ -n "$chunk_id" && -s "$r1_path" && -s "$r2_path" ]] || return 1
-    validate_fastq_pair "$r1_path" "$r2_path" || return 1
-    observed_pairs="$(count_fastq_reads "$r1_path")" || return 1
-    [[ "$observed_pairs" == "$n_read_pairs" ]] || return 1
-  done < "$CHUNKS_TSV"
+  progress_msg "validating existing chunks manifest (${CHUNK_VALIDATE_MODE} mode)"
+
+  local valid=1
+  if [[ -s "$CHUNKS_TSV" ]]; then
+    local count
+    count="$(tail -n +2 "$CHUNKS_TSV" | awk 'END { print NR + 0 }')"
+    if [[ "$count" -gt 0 ]]; then
+      valid=0
+      local chunk_id r1_path r2_path n_read_pairs
+      while IFS=$'\t' read -r chunk_id r1_path r2_path n_read_pairs; do
+        [[ "$chunk_id" == "chunk_id" ]] && continue
+        [[ -n "$chunk_id" ]] || { valid=1; break; }
+        [[ "$n_read_pairs" =~ ^[0-9]+$ && "$n_read_pairs" -gt 0 ]] || { valid=1; break; }
+
+        case "$CHUNK_VALIDATE_MODE" in
+          light)
+            validate_chunk_fastq_light "$r1_path" "$r2_path" || { valid=1; break; }
+            ;;
+          strict)
+            validate_chunk_fastq_strict "$r1_path" "$r2_path" "$n_read_pairs" || { valid=1; break; }
+            ;;
+          *)
+            valid=1
+            break
+            ;;
+        esac
+      done < "$CHUNKS_TSV"
+    fi
+  fi
+
+  if [[ "$valid" -eq 0 ]]; then
+    progress_msg "chunks manifest validation complete (${CHUNK_VALIDATE_MODE} mode)"
+    return 0
+  fi
+
+  progress_msg "chunks manifest validation failed; chunk splitting will be regenerated"
+  return 1
 }
 
 chunk_total_count() {
@@ -423,6 +470,7 @@ print_run_summary() {
   progress_msg "  enzyme: ${ENZYME}"
   progress_msg "  threads: ${THREADS}"
   progress_msg "  chunk size: ${CHUNK_SIZE}"
+  progress_msg "  chunk validate mode: ${CHUNK_VALIDATE_MODE}"
   progress_msg "  max chunks: ${MAX_CHUNKS}"
   progress_msg "  workdir: ${WORKDIR}"
   progress_msg "  outdir: ${OUTDIR}"
@@ -1026,6 +1074,7 @@ parse_args() {
       --outdir) OUTDIR="$2"; shift 2 ;;
       --threads) THREADS="$2"; shift 2 ;;
       --chunk-size) CHUNK_SIZE="$2"; shift 2 ;;
+      --chunk-validate-mode) CHUNK_VALIDATE_MODE="$2"; shift 2 ;;
       --min-mapq) MIN_MAPQ="$2"; shift 2 ;;
       --short-cis-cutoff) SHORT_CIS_CUTOFF="$2"; shift 2 ;;
       --max-chunks) MAX_CHUNKS="$2"; shift 2 ;;
@@ -1041,6 +1090,10 @@ parse_args() {
   }
   [[ "$THREADS" =~ ^[0-9]+$ && "$THREADS" -gt 0 ]] || die "--threads must be a positive integer"
   [[ "$CHUNK_SIZE" =~ ^[0-9]+$ && "$CHUNK_SIZE" -gt 0 ]] || die "--chunk-size must be a positive integer"
+  case "$CHUNK_VALIDATE_MODE" in
+    light|strict) ;;
+    *) die "--chunk-validate-mode must be 'light' or 'strict'" ;;
+  esac
   [[ "$MIN_MAPQ" =~ ^[0-9]+$ ]] || die "--min-mapq must be a nonnegative integer"
   [[ "$SHORT_CIS_CUTOFF" =~ ^[0-9]+$ ]] || die "--short-cis-cutoff must be a nonnegative integer"
   [[ "$MAX_CHUNKS" =~ ^[0-9]+$ ]] || die "--max-chunks must be a nonnegative integer"
