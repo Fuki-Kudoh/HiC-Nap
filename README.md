@@ -38,6 +38,7 @@ Optional arguments:
 ```bash
 --threads 14
 --chunk-size 10000000
+--chunk-validate-mode light|strict
 --min-mapq 30
 --short-cis-cutoff 2000
 --max-chunks 0
@@ -108,6 +109,22 @@ outdir/status/.locks/SAMPLE.lock
 This lock is acquired before `--force-init`, so force reinitialization cannot delete another active sample lock.
 
 Reference preparation is also locked per genome/enzyme under `outdir/genome/.locks/`, so multiple samples can safely share reference preparation.
+
+## Chunk Manifest Validation
+
+HiC-Nap validates existing FASTQ chunks before resuming from a previous run.
+
+By default, validation uses `--chunk-validate-mode light`, which checks that each chunk has a non-empty ID, is listed with a positive `n_read_pairs` value in `chunks.tsv`, and has non-empty R1/R2 FASTQs that pass `gzip -t`. This avoids re-counting every read on restart.
+
+For maximum conservativeness, use:
+
+```bash
+--chunk-validate-mode strict
+```
+
+Strict mode decompresses all chunk FASTQs and verifies that R1/R2 read counts match the `n_read_pairs` column in `chunks.tsv`. This is safer but can be slow for large Hi-C datasets.
+
+In light mode, a gzip-valid FASTQ with the wrong read count may not be detected during manifest validation. It should still fail later when that chunk is processed by `trim_galore` or downstream validation.
 
 ## Nightly Partial Runs
 
