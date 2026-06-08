@@ -17,6 +17,10 @@ SHORT_CIS_CUTOFF=2000
 MAX_CHUNKS=0
 FORCE_INIT=0
 STATUS_ONLY=0
+STOP_AFTER_CHUNKS=0
+SKIP_CHUNKS=0
+MERGE_MEMORY=4G
+MERGE_MAX_NMERGE=8
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPLIT_HELPER="${SCRIPT_DIR}/split_pe_fastq.py"
@@ -50,6 +54,10 @@ Optional:
   --min-mapq 30
   --short-cis-cutoff 2000
   --max-chunks 0
+  --stop-after-chunks
+  --skip-chunks
+  --merge-memory 4G
+  --merge-max-nmerge 8
   --force-init
   --status-only
 EOF
@@ -166,6 +174,12 @@ init_status() {
   init_one_status "$CHUNK_SPLIT_STATUS"
   init_one_status "$ALL_CHUNKS_STATUS"
   init_one_status "$FINAL_STATUS"
+  init_one_status "$CHUNK_OUTPUTS_STATUS"
+  init_one_status "$MERGE_STATUS"
+  init_one_status "$DEDUP_STATUS"
+  init_one_status "$SPLIT_PAIRS_STATUS"
+  init_one_status "$PAIRIX_STATUS"
+  init_one_status "$VALID_PAIRS_STATUS"
 }
 
 validate_gzip() {
@@ -236,6 +250,28 @@ validate_pairsam_gz() {
   '
 }
 
+validate_pairs_gz() {
+  local path="$1"
+  [[ -s "$path" ]] || return 1
+  validate_gzip "$path" || return 1
+  gzip -cd "$path" | awk '
+    BEGIN { columns = 0 }
+    /^#columns:/ {
+      if ($0 ~ /readID/ && $0 ~ /chrom1/ && $0 ~ /pos1/ &&
+          $0 ~ /chrom2/ && $0 ~ /pos2/ && $0 ~ /strand1/ &&
+          $0 ~ /strand2/ && $0 ~ /pair_type/) {
+        columns = 1
+      }
+    }
+    END { exit ! columns }
+  '
+}
+
+validate_pairix_index() {
+  local path="$1"
+  [[ -s "$path" ]]
+}
+
 validate_sam() {
   local path="$1"
   [[ -s "$path" ]] || return 1
@@ -263,19 +299,35 @@ prepare_dirs() {
   CHUNK_STATUS_ROOT="${STATUS_DIR}/chunks"
   CHUNK_FASTQ_DIR="${OUTDIR}/chunks/${SAMPLE}/fastq"
   CHUNK_PROCESSED_ROOT="${OUTDIR}/chunks/${SAMPLE}/processed"
+  PAIRS_DIR="${OUTDIR}/pairs"
+  STATS_DIR="${OUTDIR}/stats"
   SAMPLE_WORKDIR="${WORKDIR}/${SAMPLE}"
   SAMPLE_TMPDIR="${SAMPLE_WORKDIR}/tmp"
   SAMPLE_WORK_CHUNKS="${SAMPLE_WORKDIR}/chunks"
+  SAMPLE_MERGE_DIR="${SAMPLE_WORKDIR}/merge"
+  SAMPLE_MERGE_TMPDIR="${SAMPLE_MERGE_DIR}/tmp"
   GLOBAL_LOG="${LOG_DIR}/global.log"
   PIPELINE_STATUS="${STATUS_DIR}/pipeline.status"
   QC_STATUS="${STATUS_DIR}/qc.status"
   CHUNK_SPLIT_STATUS="${STATUS_DIR}/chunk_split.status"
   ALL_CHUNKS_STATUS="${STATUS_DIR}/all_chunks.status"
   FINAL_STATUS="${STATUS_DIR}/final.status"
+  CHUNK_OUTPUTS_STATUS="${STATUS_DIR}/chunk_outputs.status"
+  MERGE_STATUS="${STATUS_DIR}/merge.status"
+  DEDUP_STATUS="${STATUS_DIR}/dedup.status"
+  SPLIT_PAIRS_STATUS="${STATUS_DIR}/split_pairs.status"
+  PAIRIX_STATUS="${STATUS_DIR}/pairix.status"
+  VALID_PAIRS_STATUS="${STATUS_DIR}/valid_pairs.status"
   CHUNKS_TSV="${STATUS_DIR}/chunks.tsv"
+  CHUNK_PAIRSAM_LIST="${STATUS_DIR}/chunk_pairsam.list"
+  MERGED_PAIRSAM="${SAMPLE_MERGE_DIR}/${SAMPLE}.merged.selected.sorted.pairsam.gz"
+  DEDUP_PAIRSAM="${SAMPLE_MERGE_DIR}/${SAMPLE}.dedup.pairsam.gz"
+  DEDUP_STATS="${STATS_DIR}/${SAMPLE}.dedup.stats"
+  VALID_PAIRS="${PAIRS_DIR}/${SAMPLE}.valid.pairs.gz"
+  VALID_PAIRS_INDEX="${VALID_PAIRS}.px2"
   mkdir -p "$FASTQC_DIR" "$LOG_DIR" "$CHUNK_LOG_DIR" "$GENOME_DIR" "$LOCK_ROOT" "$STATUS_DIR" \
     "$CHUNK_STATUS_ROOT" "$CHUNK_FASTQ_DIR" "$CHUNK_PROCESSED_ROOT" \
-    "$SAMPLE_TMPDIR" "$SAMPLE_WORK_CHUNKS"
+    "$PAIRS_DIR" "$STATS_DIR" "$SAMPLE_TMPDIR" "$SAMPLE_WORK_CHUNKS" "$SAMPLE_MERGE_TMPDIR"
 }
 
 prepare_reference() {
@@ -472,6 +524,10 @@ print_run_summary() {
   progress_msg "  chunk size: ${CHUNK_SIZE}"
   progress_msg "  chunk validate mode: ${CHUNK_VALIDATE_MODE}"
   progress_msg "  max chunks: ${MAX_CHUNKS}"
+  progress_msg "  stop after chunks: ${STOP_AFTER_CHUNKS}"
+  progress_msg "  skip chunks: ${SKIP_CHUNKS}"
+  progress_msg "  merge memory: ${MERGE_MEMORY}"
+  progress_msg "  merge max nmerge: ${MERGE_MAX_NMERGE}"
   progress_msg "  workdir: ${WORKDIR}"
   progress_msg "  outdir: ${OUTDIR}"
 }
@@ -506,6 +562,7 @@ print_final_summary() {
   progress_msg "  completed chunks: ${completed_chunks}"
   progress_msg "  incomplete chunks: ${incomplete_chunks}"
   progress_msg "  final pipeline.status: ${pipeline_status}"
+  progress_msg "  valid pairs.status: $(get_status "${VALID_PAIRS_STATUS:-}")"
   progress_msg "  status directory: ${STATUS_DIR}"
   progress_msg "  logs directory: ${LOG_DIR}"
 }
@@ -926,19 +983,292 @@ check_all_chunks_done() {
   done < "$CHUNKS_TSV"
   [[ "$total" -gt 0 ]] || return 1
   atomic_set_status "$ALL_CHUNKS_STATUS" "done"
-  atomic_set_status "$FINAL_STATUS" "done"
-  atomic_set_status "$PIPELINE_STATUS" "done"
-  {
-    printf 'sample_id\t%s\n' "$SAMPLE"
-    printf 'date\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
-    printf 'number_of_chunks\t%s\n' "$total"
-    printf 'chunk_size\t%s\n' "$CHUNK_SIZE"
-    printf 'genome_name\t%s\n' "$GENOME_NAME"
-    printf 'enzyme\t%s\n' "$ENZYME"
-    printf 'min_mapq\t%s\n' "$MIN_MAPQ"
-    printf 'short_cis_cutoff\t%s\n' "$SHORT_CIS_CUTOFF"
-  } > "${STATUS_DIR}/pipeline.done"
   return 0
+}
+
+reset_phase2_statuses_from() {
+  local step="$1"
+  case "$step" in
+    chunk_outputs)
+      rm -f "$MERGED_PAIRSAM" "$DEDUP_PAIRSAM" "$VALID_PAIRS" "$VALID_PAIRS_INDEX" "$DEDUP_STATS"
+      atomic_set_status "$MERGE_STATUS" "null"
+      atomic_set_status "$DEDUP_STATUS" "null"
+      atomic_set_status "$SPLIT_PAIRS_STATUS" "null"
+      atomic_set_status "$PAIRIX_STATUS" "null"
+      atomic_set_status "$VALID_PAIRS_STATUS" "null"
+      ;;
+    merge)
+      rm -f "$MERGED_PAIRSAM" "$DEDUP_PAIRSAM" "$VALID_PAIRS" "$VALID_PAIRS_INDEX" "$DEDUP_STATS"
+      atomic_set_status "$DEDUP_STATUS" "null"
+      atomic_set_status "$SPLIT_PAIRS_STATUS" "null"
+      atomic_set_status "$PAIRIX_STATUS" "null"
+      atomic_set_status "$VALID_PAIRS_STATUS" "null"
+      ;;
+    dedup)
+      rm -f "$DEDUP_PAIRSAM" "$VALID_PAIRS" "$VALID_PAIRS_INDEX" "$DEDUP_STATS"
+      atomic_set_status "$SPLIT_PAIRS_STATUS" "null"
+      atomic_set_status "$PAIRIX_STATUS" "null"
+      atomic_set_status "$VALID_PAIRS_STATUS" "null"
+      ;;
+    split_pairs)
+      rm -f "$VALID_PAIRS" "$VALID_PAIRS_INDEX"
+      atomic_set_status "$PAIRIX_STATUS" "null"
+      atomic_set_status "$VALID_PAIRS_STATUS" "null"
+      ;;
+    pairix)
+      rm -f "$VALID_PAIRS_INDEX"
+      atomic_set_status "$VALID_PAIRS_STATUS" "null"
+      ;;
+  esac
+}
+
+phase2_step_valid() {
+  local step="$1"
+  case "$step" in
+    chunk_outputs) [[ -s "$CHUNK_PAIRSAM_LIST" ]] ;;
+    merge) validate_pairsam_gz "$MERGED_PAIRSAM" ;;
+    dedup) validate_pairsam_gz "$DEDUP_PAIRSAM" && [[ -s "$DEDUP_STATS" ]] ;;
+    split_pairs) validate_pairs_gz "$VALID_PAIRS" ;;
+    pairix) validate_pairix_index "$VALID_PAIRS_INDEX" ;;
+    valid_pairs) validate_pairs_gz "$VALID_PAIRS" && validate_pairix_index "$VALID_PAIRS_INDEX" ;;
+    *) return 1 ;;
+  esac
+}
+
+phase2_complete_or_reset() {
+  local step="$1"
+  local status_file="$2"
+  if [[ "$(get_status "$status_file")" == "done" ]]; then
+    if phase2_step_valid "$step"; then
+      return 0
+    fi
+    log_msg "${step} status was done but validation failed; resetting downstream"
+  fi
+  reset_phase2_statuses_from "$step"
+  atomic_set_status "$status_file" "null"
+  return 1
+}
+
+fallback_discover_chunk_outputs() {
+  local processed_root="${CHUNK_PROCESSED_ROOT}"
+  [[ -d "$processed_root" ]] || return 1
+  progress_msg "WARNING: chunks.tsv missing; falling back to discovered chunk.selected.sorted.pairsam.gz files"
+  find "$processed_root" -name "chunk.selected.sorted.pairsam.gz" -type f | sort > "${CHUNK_PAIRSAM_LIST}.tmp"
+  [[ -s "${CHUNK_PAIRSAM_LIST}.tmp" ]] || { rm -f "${CHUNK_PAIRSAM_LIST}.tmp"; return 1; }
+  local total=0 validated=0 path
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    total=$((total + 1))
+    if validate_pairsam_gz "$path"; then
+      printf '%s\n' "$path" >> "${CHUNK_PAIRSAM_LIST}.validating"
+      validated=$((validated + 1))
+    else
+      rm -f "${CHUNK_PAIRSAM_LIST}.tmp" "${CHUNK_PAIRSAM_LIST}.validating"
+      return 1
+    fi
+  done < "${CHUNK_PAIRSAM_LIST}.tmp"
+  rm -f "${CHUNK_PAIRSAM_LIST}.tmp"
+  [[ "$total" -gt 0 && "$validated" -eq "$total" ]] || { rm -f "${CHUNK_PAIRSAM_LIST}.validating"; return 1; }
+  mv "${CHUNK_PAIRSAM_LIST}.validating" "$CHUNK_PAIRSAM_LIST"
+  progress_msg "validated chunk outputs: ${validated}/${total}"
+  return 0
+}
+
+validate_chunk_outputs() {
+  progress_msg "validating chunk-level selected pairsam outputs"
+  rm -f "${CHUNK_PAIRSAM_LIST}.tmp" "${CHUNK_PAIRSAM_LIST}.validating"
+
+  local expected=0 validated=0
+  if [[ ! -s "$CHUNKS_TSV" ]]; then
+    if fallback_discover_chunk_outputs; then
+      atomic_set_status "$CHUNK_OUTPUTS_STATUS" "done"
+      return 0
+    fi
+    progress_msg "chunk output validation failed"
+    atomic_set_status "$CHUNK_OUTPUTS_STATUS" "failed"
+    reset_phase2_statuses_from chunk_outputs
+    return 1
+  fi
+
+  local chunk_id chunk_r1 chunk_r2 n_read_pairs selected_path
+  while IFS=$'\t' read -r chunk_id chunk_r1 chunk_r2 n_read_pairs; do
+    [[ "$chunk_id" == "chunk_id" ]] && continue
+    [[ -n "$chunk_id" ]] || { progress_msg "chunk output validation failed"; atomic_set_status "$CHUNK_OUTPUTS_STATUS" "failed"; reset_phase2_statuses_from chunk_outputs; return 1; }
+    expected=$((expected + 1))
+    selected_path="${CHUNK_PROCESSED_ROOT}/${chunk_id}/chunk.selected.sorted.pairsam.gz"
+    if validate_pairsam_gz "$selected_path"; then
+      printf '%s\n' "$selected_path" >> "${CHUNK_PAIRSAM_LIST}.validating"
+      validated=$((validated + 1))
+    else
+      progress_msg "chunk output validation failed"
+      atomic_set_status "$CHUNK_OUTPUTS_STATUS" "failed"
+      reset_phase2_statuses_from chunk_outputs
+      return 1
+    fi
+  done < "$CHUNKS_TSV"
+
+  if [[ "$expected" -gt 0 && "$validated" -eq "$expected" ]]; then
+    mv "${CHUNK_PAIRSAM_LIST}.validating" "$CHUNK_PAIRSAM_LIST"
+    progress_msg "validated chunk outputs: ${validated}/${expected}"
+    atomic_set_status "$CHUNK_OUTPUTS_STATUS" "done"
+    return 0
+  fi
+
+  rm -f "${CHUNK_PAIRSAM_LIST}.validating"
+  progress_msg "chunk output validation failed"
+  atomic_set_status "$CHUNK_OUTPUTS_STATUS" "failed"
+  reset_phase2_statuses_from chunk_outputs
+  return 1
+}
+
+run_merge_step() {
+  phase2_complete_or_reset merge "$MERGE_STATUS" && return
+  progress_msg "merging chunk pairsam files"
+  local log_file="${LOG_DIR}/merge.log"
+  local -a chunk_pairsams
+  local chunk_pairsam total_arg_chars=0
+  while IFS= read -r chunk_pairsam; do
+    [[ -n "$chunk_pairsam" ]] || continue
+    chunk_pairsams+=("$chunk_pairsam")
+    total_arg_chars=$((total_arg_chars + ${#chunk_pairsam} + 1))
+  done < "$CHUNK_PAIRSAM_LIST"
+  [[ "${#chunk_pairsams[@]}" -gt 0 ]] || die "No chunk pairsam files listed in ${CHUNK_PAIRSAM_LIST}"
+  if [[ "$total_arg_chars" -gt 1800000 ]]; then
+    die "Too many chunk pairsam paths for one pairtools merge command; staged merge batching is required for this sample"
+  fi
+  mkdir -p "$SAMPLE_MERGE_TMPDIR"
+  local cmd_text="pairtools merge --nproc ${THREADS} --memory ${MERGE_MEMORY} --max-nmerge ${MERGE_MAX_NMERGE} --tmpdir ${SAMPLE_MERGE_TMPDIR} --output ${MERGED_PAIRSAM} <${#chunk_pairsams[@]} chunk pairsam files>"
+  atomic_set_status "$MERGE_STATUS" "running"
+  CURRENT_STATUS_FILE="$MERGE_STATUS"
+  write_step_log_header "$log_file" "$cmd_text" "$MERGED_PAIRSAM"
+  set +e
+  pairtools merge --nproc "$THREADS" --memory "$MERGE_MEMORY" --max-nmerge "$MERGE_MAX_NMERGE" \
+    --tmpdir "$SAMPLE_MERGE_TMPDIR" --output "$MERGED_PAIRSAM" "${chunk_pairsams[@]}" >> "$log_file" 2>&1
+  local exit_code=$?
+  set -e
+  write_step_log_footer "$log_file" "$exit_code"
+  CURRENT_STATUS_FILE=""
+  if [[ "$exit_code" -eq 0 ]] && validate_pairsam_gz "$MERGED_PAIRSAM"; then
+    atomic_set_status "$MERGE_STATUS" "done"
+  else
+    atomic_set_status "$MERGE_STATUS" "failed"
+    die "pairtools merge failed"
+  fi
+}
+
+run_dedup_step() {
+  phase2_complete_or_reset dedup "$DEDUP_STATUS" && return
+  progress_msg "global deduplication"
+  local log_file="${LOG_DIR}/dedup.log"
+  local cmd_text="pairtools dedup --nproc-in ${THREADS} --nproc-out ${THREADS} --mark-dups --output-stats ${DEDUP_STATS} --output ${DEDUP_PAIRSAM} ${MERGED_PAIRSAM}"
+  atomic_set_status "$DEDUP_STATUS" "running"
+  CURRENT_STATUS_FILE="$DEDUP_STATUS"
+  write_step_log_header "$log_file" "$cmd_text" "$DEDUP_PAIRSAM $DEDUP_STATS"
+  set +e
+  pairtools dedup --nproc-in "$THREADS" --nproc-out "$THREADS" --mark-dups \
+    --output-stats "$DEDUP_STATS" --output "$DEDUP_PAIRSAM" "$MERGED_PAIRSAM" >> "$log_file" 2>&1
+  local exit_code=$?
+  set -e
+  write_step_log_footer "$log_file" "$exit_code"
+  CURRENT_STATUS_FILE=""
+  if [[ "$exit_code" -eq 0 ]] && validate_pairsam_gz "$DEDUP_PAIRSAM" && [[ -s "$DEDUP_STATS" ]]; then
+    atomic_set_status "$DEDUP_STATUS" "done"
+  else
+    atomic_set_status "$DEDUP_STATUS" "failed"
+    die "pairtools dedup failed"
+  fi
+}
+
+run_split_pairs_step() {
+  phase2_complete_or_reset split_pairs "$SPLIT_PAIRS_STATUS" && return
+  progress_msg "writing valid pairs file"
+  local log_file="${LOG_DIR}/split_pairs.log"
+  local cmd_text="pairtools split --nproc-in ${THREADS} --nproc-out ${THREADS} --output-pairs ${VALID_PAIRS} ${DEDUP_PAIRSAM}"
+  atomic_set_status "$SPLIT_PAIRS_STATUS" "running"
+  CURRENT_STATUS_FILE="$SPLIT_PAIRS_STATUS"
+  write_step_log_header "$log_file" "$cmd_text" "$VALID_PAIRS"
+  set +e
+  pairtools split --nproc-in "$THREADS" --nproc-out "$THREADS" --output-pairs "$VALID_PAIRS" "$DEDUP_PAIRSAM" >> "$log_file" 2>&1
+  local exit_code=$?
+  set -e
+  write_step_log_footer "$log_file" "$exit_code"
+  CURRENT_STATUS_FILE=""
+  if [[ "$exit_code" -eq 0 ]] && validate_pairs_gz "$VALID_PAIRS"; then
+    atomic_set_status "$SPLIT_PAIRS_STATUS" "done"
+  else
+    atomic_set_status "$SPLIT_PAIRS_STATUS" "failed"
+    die "pairtools split failed"
+  fi
+}
+
+run_pairix_step() {
+  phase2_complete_or_reset pairix "$PAIRIX_STATUS" && return
+  progress_msg "indexing valid pairs with pairix"
+  local log_file="${LOG_DIR}/pairix.log"
+  local cmd_text="pairix ${VALID_PAIRS}"
+  atomic_set_status "$PAIRIX_STATUS" "running"
+  CURRENT_STATUS_FILE="$PAIRIX_STATUS"
+  write_step_log_header "$log_file" "$cmd_text" "$VALID_PAIRS_INDEX"
+  set +e
+  pairix "$VALID_PAIRS" >> "$log_file" 2>&1
+  local exit_code=$?
+  set -e
+  write_step_log_footer "$log_file" "$exit_code"
+  CURRENT_STATUS_FILE=""
+  if [[ "$exit_code" -eq 0 ]] && validate_pairix_index "$VALID_PAIRS_INDEX"; then
+    atomic_set_status "$PAIRIX_STATUS" "done"
+  else
+    atomic_set_status "$PAIRIX_STATUS" "failed"
+    die "pairix indexing failed"
+  fi
+}
+
+finalize_valid_pairs() {
+  if [[ "$(get_status "$SPLIT_PAIRS_STATUS")" == "done" && "$(get_status "$PAIRIX_STATUS")" == "done" ]] && phase2_step_valid valid_pairs; then
+    atomic_set_status "$VALID_PAIRS_STATUS" "done"
+    atomic_set_status "$FINAL_STATUS" "done"
+    atomic_set_status "$PIPELINE_STATUS" "done"
+    {
+      printf 'sample_id\t%s\n' "$SAMPLE"
+      printf 'date\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+      printf 'number_of_chunks\t%s\n' "$(chunk_total_count)"
+      printf 'chunk_size\t%s\n' "$CHUNK_SIZE"
+      printf 'genome_name\t%s\n' "$GENOME_NAME"
+      printf 'enzyme\t%s\n' "$ENZYME"
+      printf 'min_mapq\t%s\n' "$MIN_MAPQ"
+      printf 'short_cis_cutoff\t%s\n' "$SHORT_CIS_CUTOFF"
+      printf 'valid_pairs\t%s\n' "$VALID_PAIRS"
+      printf 'pairix_index\t%s\n' "$VALID_PAIRS_INDEX"
+    } > "${STATUS_DIR}/pipeline.done"
+    progress_msg "valid pairs complete: ${VALID_PAIRS}"
+    return 0
+  fi
+  atomic_set_status "$VALID_PAIRS_STATUS" "failed"
+  atomic_set_status "$FINAL_STATUS" "null"
+  atomic_set_status "$PIPELINE_STATUS" "failed"
+  return 1
+}
+
+run_sample_pairs_phase() {
+  progress_msg "starting sample-level pairs generation"
+  if [[ "$(get_status "$CHUNK_OUTPUTS_STATUS")" == "done" && -s "$CHUNK_PAIRSAM_LIST" ]]; then
+    if ! validate_chunk_outputs; then
+      die "No valid chunk outputs are available for sample-level pairs generation"
+    fi
+  else
+    atomic_set_status "$CHUNK_OUTPUTS_STATUS" "running"
+    CURRENT_STATUS_FILE="$CHUNK_OUTPUTS_STATUS"
+    if ! validate_chunk_outputs; then
+      CURRENT_STATUS_FILE=""
+      die "No valid chunk outputs are available for sample-level pairs generation"
+    fi
+    CURRENT_STATUS_FILE=""
+  fi
+  run_merge_step
+  run_dedup_step
+  run_split_pairs_step
+  run_pairix_step
+  finalize_valid_pairs || die "Final valid pairs validation failed"
 }
 
 print_status() {
@@ -988,6 +1318,18 @@ Per-step incomplete counts:
   sort: ${sort_incomplete}
   restrict: ${restrict_incomplete}
   select: ${select_incomplete}
+
+Sample-level pairs:
+  chunk_outputs: $(get_status "$CHUNK_OUTPUTS_STATUS")
+  merge: $(get_status "$MERGE_STATUS")
+  dedup: $(get_status "$DEDUP_STATUS")
+  split_pairs: $(get_status "$SPLIT_PAIRS_STATUS")
+  pairix: $(get_status "$PAIRIX_STATUS")
+  valid_pairs: $(get_status "$VALID_PAIRS_STATUS")
+
+Outputs:
+  valid pairs: ${VALID_PAIRS}
+  pairix index: ${VALID_PAIRS_INDEX}
 EOF
 }
 
@@ -1050,15 +1392,18 @@ preflight() {
   [[ -r "$R1" ]] || die "R1 FASTQ is missing or unreadable: ${R1}"
   [[ -r "$R2" ]] || die "R2 FASTQ is missing or unreadable: ${R2}"
   [[ -r "$GENOME_FA" ]] || die "Genome FASTA is missing or unreadable: ${GENOME_FA}"
-  require_command fastqc
-  require_command trim_galore
-  require_command bwa
-  require_command samtools
+  if [[ "$SKIP_CHUNKS" -eq 0 ]]; then
+    require_command fastqc
+    require_command trim_galore
+    require_command bwa
+    require_command samtools
+    require_command cooler
+    require_command python3
+    [[ -s "$SPLIT_HELPER" ]] || die "FASTQ split helper not found: ${SPLIT_HELPER}"
+  fi
   require_command pairtools
-  require_command cooler
+  require_command pairix
   require_command gzip
-  require_command python3
-  [[ -s "$SPLIT_HELPER" ]] || die "FASTQ split helper not found: ${SPLIT_HELPER}"
 }
 
 parse_args() {
@@ -1078,6 +1423,10 @@ parse_args() {
       --min-mapq) MIN_MAPQ="$2"; shift 2 ;;
       --short-cis-cutoff) SHORT_CIS_CUTOFF="$2"; shift 2 ;;
       --max-chunks) MAX_CHUNKS="$2"; shift 2 ;;
+      --stop-after-chunks) STOP_AFTER_CHUNKS=1; shift ;;
+      --skip-chunks) SKIP_CHUNKS=1; shift ;;
+      --merge-memory) MERGE_MEMORY="$2"; shift 2 ;;
+      --merge-max-nmerge) MERGE_MAX_NMERGE="$2"; shift 2 ;;
       --force-init) FORCE_INIT=1; shift ;;
       --status-only) STATUS_ONLY=1; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -1097,6 +1446,10 @@ parse_args() {
   [[ "$MIN_MAPQ" =~ ^[0-9]+$ ]] || die "--min-mapq must be a nonnegative integer"
   [[ "$SHORT_CIS_CUTOFF" =~ ^[0-9]+$ ]] || die "--short-cis-cutoff must be a nonnegative integer"
   [[ "$MAX_CHUNKS" =~ ^[0-9]+$ ]] || die "--max-chunks must be a nonnegative integer"
+  [[ "$MERGE_MAX_NMERGE" =~ ^[0-9]+$ && "$MERGE_MAX_NMERGE" -gt 0 ]] || die "--merge-max-nmerge must be a positive integer"
+  if [[ "$STOP_AFTER_CHUNKS" -eq 1 && "$SKIP_CHUNKS" -eq 1 ]]; then
+    die "--stop-after-chunks and --skip-chunks cannot be used together"
+  fi
 }
 
 main() {
@@ -1114,15 +1467,27 @@ main() {
   print_run_summary
   preflight
   atomic_set_status "$PIPELINE_STATUS" "running"
-  prepare_reference
-  run_fastqc
-  split_fastq_chunks
-  process_all_chunks
-  if check_all_chunks_done; then
-    log_msg "Pipeline complete for sample ${SAMPLE}"
+  if [[ "$SKIP_CHUNKS" -eq 0 ]]; then
+    prepare_reference
+    run_fastqc
+    split_fastq_chunks
+    process_all_chunks
   else
+    progress_msg "skipping chunk preprocessing as requested"
+  fi
+  if [[ "$SKIP_CHUNKS" -eq 1 ]]; then
+    run_sample_pairs_phase
+    log_msg "Pipeline complete for sample ${SAMPLE}"
+  elif ! check_all_chunks_done; then
     atomic_set_status "$PIPELINE_STATUS" "null"
     log_msg "Pipeline stopped cleanly with incomplete chunks; pipeline status reset to null"
+  elif [[ "$STOP_AFTER_CHUNKS" -eq 1 ]]; then
+    atomic_set_status "$FINAL_STATUS" "null"
+    atomic_set_status "$PIPELINE_STATUS" "null"
+    progress_msg "stopped after chunk preprocessing as requested"
+  else
+    run_sample_pairs_phase
+    log_msg "Pipeline complete for sample ${SAMPLE}"
   fi
   print_final_summary
 }
