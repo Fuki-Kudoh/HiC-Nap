@@ -2,7 +2,7 @@
 
 HiC-Nap is a conservative, restartable, chunk-based Hi-C preprocessing pipeline for paired-end FASTQ files on a local Linux workstation.
 
-Version 0.2.0 runs chunk-level preprocessing, then globally merges and deduplicates all selected chunk `pairsam.gz` files to produce an indexed sample-level valid pairs file:
+Version 0.2.0 runs chunk-level preprocessing, then globally merges and deduplicates all selected chunk `pairsam.gz` files to produce a BGZF-compressed, pairix-indexed sample-level valid pairs file:
 
 ```text
 outdir/pairs/SAMPLE.valid.pairs.gz
@@ -21,11 +21,12 @@ The pipeline is written as Bash plus a small Python standard-library FASTQ split
 - `samtools`
 - `pairtools`
 - `pairix`
+- `bgzip`
 - `cooler`
 - `gzip`
 - `python3`
 
-`bgzip` is not called directly by HiC-Nap.
+HiC-Nap calls `bgzip` during `pairtools split` to ensure the final valid pairs output is compatible with pairix indexing.
 
 ## Usage
 
@@ -109,7 +110,7 @@ Each completed chunk produces:
 outdir/chunks/SAMPLE/processed/chunk_000001/chunk.selected.sorted.pairsam.gz
 ```
 
-The completed sample-level phase produces:
+The completed sample-level phase produces BGZF-compressed and pairix-indexed valid pairs:
 
 ```text
 outdir/pairs/SAMPLE.valid.pairs.gz

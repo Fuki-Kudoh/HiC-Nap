@@ -268,8 +268,21 @@ validate_pairs_gz() {
 }
 
 validate_pairix_index() {
-  local path="$1"
-  [[ -s "$path" ]]
+  local index_path="$1"
+  local pairs_path="${2:-}"
+  [[ -s "$index_path" ]] || return 1
+  if [[ -n "$pairs_path" ]]; then
+    validate_pairs_gz "$pairs_path" || return 1
+    pairix -l "$pairs_path" >/dev/null 2>&1 || return 1
+  fi
+}
+
+bgzip_cmd_out() {
+  if bgzip --help 2>&1 | grep -q -- '-@'; then
+    printf 'bgzip -c -@ %s\n' "$THREADS"
+  else
+    printf 'bgzip -c\n'
+  fi
 }
 
 validate_sam() {
@@ -1029,8 +1042,8 @@ phase2_step_valid() {
     merge) validate_pairsam_gz "$MERGED_PAIRSAM" ;;
     dedup) validate_pairsam_gz "$DEDUP_PAIRSAM" && [[ -s "$DEDUP_STATS" ]] ;;
     split_pairs) validate_pairs_gz "$VALID_PAIRS" ;;
-    pairix) validate_pairix_index "$VALID_PAIRS_INDEX" ;;
-    valid_pairs) validate_pairs_gz "$VALID_PAIRS" && validate_pairix_index "$VALID_PAIRS_INDEX" ;;
+    pairix) validate_pairix_index "$VALID_PAIRS_INDEX" "$VALID_PAIRS" ;;
+    valid_pairs) validate_pairix_index "$VALID_PAIRS_INDEX" "$VALID_PAIRS" ;;
     *) return 1 ;;
   esac
 }
@@ -1183,12 +1196,15 @@ run_split_pairs_step() {
   phase2_complete_or_reset split_pairs "$SPLIT_PAIRS_STATUS" && return
   progress_msg "writing valid pairs file"
   local log_file="${LOG_DIR}/split_pairs.log"
-  local cmd_text="pairtools split --nproc-in ${THREADS} --nproc-out ${THREADS} --output-pairs ${VALID_PAIRS} ${DEDUP_PAIRSAM}"
+  local cmd_out
+  cmd_out="$(bgzip_cmd_out)"
+  local cmd_text="pairtools split --nproc-in ${THREADS} --nproc-out ${THREADS} --cmd-out \"${cmd_out}\" --output-pairs ${VALID_PAIRS} ${DEDUP_PAIRSAM}"
   atomic_set_status "$SPLIT_PAIRS_STATUS" "running"
   CURRENT_STATUS_FILE="$SPLIT_PAIRS_STATUS"
   write_step_log_header "$log_file" "$cmd_text" "$VALID_PAIRS"
   set +e
-  pairtools split --nproc-in "$THREADS" --nproc-out "$THREADS" --output-pairs "$VALID_PAIRS" "$DEDUP_PAIRSAM" >> "$log_file" 2>&1
+  pairtools split --nproc-in "$THREADS" --nproc-out "$THREADS" --cmd-out "$cmd_out" \
+    --output-pairs "$VALID_PAIRS" "$DEDUP_PAIRSAM" >> "$log_file" 2>&1
   local exit_code=$?
   set -e
   write_step_log_footer "$log_file" "$exit_code"
@@ -1215,7 +1231,7 @@ run_pairix_step() {
   set -e
   write_step_log_footer "$log_file" "$exit_code"
   CURRENT_STATUS_FILE=""
-  if [[ "$exit_code" -eq 0 ]] && validate_pairix_index "$VALID_PAIRS_INDEX"; then
+  if [[ "$exit_code" -eq 0 ]] && validate_pairix_index "$VALID_PAIRS_INDEX" "$VALID_PAIRS"; then
     atomic_set_status "$PAIRIX_STATUS" "done"
   else
     atomic_set_status "$PAIRIX_STATUS" "failed"
@@ -1403,6 +1419,7 @@ preflight() {
   fi
   require_command pairtools
   require_command pairix
+  require_command bgzip
   require_command gzip
 }
 
