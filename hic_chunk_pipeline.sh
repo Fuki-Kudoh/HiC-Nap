@@ -21,6 +21,12 @@ STOP_AFTER_CHUNKS=0
 SKIP_CHUNKS=0
 MERGE_MEMORY=4G
 MERGE_MAX_NMERGE=8
+NO_MATRIX=0
+NO_COOL=0
+NO_HIC=0
+MATRIX_ONLY=0
+COOL_BASE_RES=10000
+MCOOL_RESOLUTIONS="10000,25000,50000,100000,250000,500000,1000000"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPLIT_HELPER="${SCRIPT_DIR}/split_pe_fastq.py"
@@ -60,6 +66,20 @@ Optional:
   --merge-max-nmerge 8
   --force-init
   --status-only
+  --no-matrix
+  --no-cool
+  --no-hic
+  --matrix-only
+  --cool-base-res 10000
+  --mcool-resolutions 10000,25000,50000,100000,250000,500000,1000000
+
+Matrix-only upgrade from v0.2.x outputs:
+  ./hic_chunk_pipeline.sh \
+    --sample SAMPLE_ID \
+    --genome-name mm10 \
+    --genome-fa /path/to/genome.fa \
+    --outdir /path/to/outdir \
+    --matrix-only
 EOF
 }
 
@@ -180,6 +200,10 @@ init_status() {
   init_one_status "$SPLIT_PAIRS_STATUS"
   init_one_status "$PAIRIX_STATUS"
   init_one_status "$VALID_PAIRS_STATUS"
+  init_one_status "$COOL_STATUS"
+  init_one_status "$MCOOL_STATUS"
+  init_one_status "$HIC_STATUS"
+  init_one_status "$MATRIX_STATUS"
 }
 
 validate_gzip() {
@@ -313,12 +337,9 @@ prepare_dirs() {
   CHUNK_FASTQ_DIR="${OUTDIR}/chunks/${SAMPLE}/fastq"
   CHUNK_PROCESSED_ROOT="${OUTDIR}/chunks/${SAMPLE}/processed"
   PAIRS_DIR="${OUTDIR}/pairs"
+  COOL_DIR="${OUTDIR}/cool"
+  HIC_DIR="${OUTDIR}/hic"
   STATS_DIR="${OUTDIR}/stats"
-  SAMPLE_WORKDIR="${WORKDIR}/${SAMPLE}"
-  SAMPLE_TMPDIR="${SAMPLE_WORKDIR}/tmp"
-  SAMPLE_WORK_CHUNKS="${SAMPLE_WORKDIR}/chunks"
-  SAMPLE_MERGE_DIR="${SAMPLE_WORKDIR}/merge"
-  SAMPLE_MERGE_TMPDIR="${SAMPLE_MERGE_DIR}/tmp"
   GLOBAL_LOG="${LOG_DIR}/global.log"
   PIPELINE_STATUS="${STATUS_DIR}/pipeline.status"
   QC_STATUS="${STATUS_DIR}/qc.status"
@@ -331,33 +352,52 @@ prepare_dirs() {
   SPLIT_PAIRS_STATUS="${STATUS_DIR}/split_pairs.status"
   PAIRIX_STATUS="${STATUS_DIR}/pairix.status"
   VALID_PAIRS_STATUS="${STATUS_DIR}/valid_pairs.status"
+  COOL_STATUS="${STATUS_DIR}/cool.status"
+  MCOOL_STATUS="${STATUS_DIR}/mcool.status"
+  HIC_STATUS="${STATUS_DIR}/hic.status"
+  MATRIX_STATUS="${STATUS_DIR}/matrix.status"
   CHUNKS_TSV="${STATUS_DIR}/chunks.tsv"
   CHUNK_PAIRSAM_LIST="${STATUS_DIR}/chunk_pairsam.list"
-  MERGED_PAIRSAM="${SAMPLE_MERGE_DIR}/${SAMPLE}.merged.selected.sorted.pairsam.gz"
-  DEDUP_PAIRSAM="${SAMPLE_MERGE_DIR}/${SAMPLE}.dedup.pairsam.gz"
   DEDUP_STATS="${STATS_DIR}/${SAMPLE}.dedup.stats"
   VALID_PAIRS="${PAIRS_DIR}/${SAMPLE}.valid.pairs.gz"
   VALID_PAIRS_INDEX="${VALID_PAIRS}.px2"
+  CHROM_SIZES="${GENOME_DIR}/${GENOME_NAME}.chrom.sizes"
+  COOL_FILE="${COOL_DIR}/${SAMPLE}.${COOL_BASE_RES}.cool"
+  MCOOL_FILE="${COOL_DIR}/${SAMPLE}.mcool"
+  HIC_FILE="${HIC_DIR}/${SAMPLE}.hic"
   mkdir -p "$FASTQC_DIR" "$LOG_DIR" "$CHUNK_LOG_DIR" "$GENOME_DIR" "$LOCK_ROOT" "$STATUS_DIR" \
-    "$CHUNK_STATUS_ROOT" "$CHUNK_FASTQ_DIR" "$CHUNK_PROCESSED_ROOT" \
-    "$PAIRS_DIR" "$STATS_DIR" "$SAMPLE_TMPDIR" "$SAMPLE_WORK_CHUNKS" "$SAMPLE_MERGE_TMPDIR"
+    "$CHUNK_STATUS_ROOT" "$PAIRS_DIR" "$COOL_DIR" "$HIC_DIR" "$STATS_DIR"
+  if [[ "$MATRIX_ONLY" -eq 0 ]]; then
+    SAMPLE_WORKDIR="${WORKDIR}/${SAMPLE}"
+    SAMPLE_TMPDIR="${SAMPLE_WORKDIR}/tmp"
+    SAMPLE_WORK_CHUNKS="${SAMPLE_WORKDIR}/chunks"
+    SAMPLE_MERGE_DIR="${SAMPLE_WORKDIR}/merge"
+    SAMPLE_MERGE_TMPDIR="${SAMPLE_MERGE_DIR}/tmp"
+    MERGED_PAIRSAM="${SAMPLE_MERGE_DIR}/${SAMPLE}.merged.selected.sorted.pairsam.gz"
+    DEDUP_PAIRSAM="${SAMPLE_MERGE_DIR}/${SAMPLE}.dedup.pairsam.gz"
+    mkdir -p "$CHUNK_FASTQ_DIR" "$CHUNK_PROCESSED_ROOT" "$SAMPLE_TMPDIR" "$SAMPLE_WORK_CHUNKS" "$SAMPLE_MERGE_TMPDIR"
+  fi
+}
+
+prepare_chrom_sizes() {
+  if [[ ! -s "${GENOME_FA}.fai" ]]; then
+    log_msg "Running samtools faidx for ${GENOME_FA}"
+    samtools faidx "$GENOME_FA" >> "$GLOBAL_LOG" 2>&1
+  fi
+  if [[ ! -s "$CHROM_SIZES" ]]; then
+    cut -f1,2 "${GENOME_FA}.fai" > "${CHROM_SIZES}.tmp"
+    mv "${CHROM_SIZES}.tmp" "$CHROM_SIZES"
+  fi
+  [[ -s "$CHROM_SIZES" ]] || die "Chrom sizes file could not be created: ${CHROM_SIZES}"
 }
 
 prepare_reference() {
   acquire_reference_lock
   log_msg "Preparing reference files if missing"
-  local chrom_sizes="${GENOME_DIR}/${GENOME_NAME}.chrom.sizes"
   local frags_bed="${GENOME_DIR}/${GENOME_NAME}.${ENZYME}.frags.bed"
-  if [[ ! -s "${GENOME_FA}.fai" ]]; then
-    log_msg "Running samtools faidx for ${GENOME_FA}"
-    samtools faidx "$GENOME_FA" >> "$GLOBAL_LOG" 2>&1
-  fi
-  if [[ ! -s "$chrom_sizes" ]]; then
-    cut -f1,2 "${GENOME_FA}.fai" > "${chrom_sizes}.tmp"
-    mv "${chrom_sizes}.tmp" "$chrom_sizes"
-  fi
+  prepare_chrom_sizes
   if [[ ! -s "$frags_bed" ]]; then
-    cooler digest "$chrom_sizes" "$GENOME_FA" "$ENZYME" > "${frags_bed}.tmp"
+    cooler digest "$CHROM_SIZES" "$GENOME_FA" "$ENZYME" > "${frags_bed}.tmp"
     mv "${frags_bed}.tmp" "$frags_bed"
   fi
   local missing_index=0
@@ -539,6 +579,12 @@ print_run_summary() {
   progress_msg "  max chunks: ${MAX_CHUNKS}"
   progress_msg "  stop after chunks: ${STOP_AFTER_CHUNKS}"
   progress_msg "  skip chunks: ${SKIP_CHUNKS}"
+  progress_msg "  matrix only: ${MATRIX_ONLY}"
+  progress_msg "  matrix enabled: $(matrix_enabled && printf '1' || printf '0')"
+  progress_msg "  cool enabled: $(cool_enabled && printf '1' || printf '0')"
+  progress_msg "  hic enabled: $(hic_enabled && printf '1' || printf '0')"
+  progress_msg "  cool base resolution: ${COOL_BASE_RES}"
+  progress_msg "  mcool resolutions: ${MCOOL_RESOLUTIONS}"
   progress_msg "  merge memory: ${MERGE_MEMORY}"
   progress_msg "  merge max nmerge: ${MERGE_MAX_NMERGE}"
   progress_msg "  workdir: ${WORKDIR}"
@@ -576,6 +622,7 @@ print_final_summary() {
   progress_msg "  incomplete chunks: ${incomplete_chunks}"
   progress_msg "  final pipeline.status: ${pipeline_status}"
   progress_msg "  valid pairs.status: $(get_status "${VALID_PAIRS_STATUS:-}")"
+  progress_msg "  matrix.status: $(get_status "${MATRIX_STATUS:-}")"
   progress_msg "  status directory: ${STATUS_DIR}"
   progress_msg "  logs directory: ${LOG_DIR}"
 }
@@ -1001,6 +1048,7 @@ check_all_chunks_done() {
 
 reset_phase2_statuses_from() {
   local step="$1"
+  reset_matrix_outputs
   case "$step" in
     chunk_outputs)
       rm -f "$MERGED_PAIRSAM" "$DEDUP_PAIRSAM" "$VALID_PAIRS" "$VALID_PAIRS_INDEX" "$DEDUP_STATS"
@@ -1046,6 +1094,18 @@ phase2_step_valid() {
     valid_pairs) validate_pairix_index "$VALID_PAIRS_INDEX" "$VALID_PAIRS" ;;
     *) return 1 ;;
   esac
+}
+
+valid_pairs_ready() {
+  phase2_step_valid valid_pairs
+}
+
+reset_matrix_outputs() {
+  rm -f "$COOL_FILE" "$MCOOL_FILE" "$HIC_FILE"
+  atomic_set_status "$COOL_STATUS" "null"
+  atomic_set_status "$MCOOL_STATUS" "null"
+  atomic_set_status "$HIC_STATUS" "null"
+  atomic_set_status "$MATRIX_STATUS" "null"
 }
 
 phase2_complete_or_reset() {
@@ -1287,6 +1347,172 @@ run_sample_pairs_phase() {
   finalize_valid_pairs || die "Final valid pairs validation failed"
 }
 
+cool_enabled() {
+  [[ "$NO_MATRIX" -eq 0 && "$NO_COOL" -eq 0 ]]
+}
+
+hic_enabled() {
+  [[ "$NO_MATRIX" -eq 0 && "$NO_HIC" -eq 0 ]]
+}
+
+matrix_enabled() {
+  [[ "$NO_MATRIX" -eq 0 ]] && { [[ "$NO_COOL" -eq 0 ]] || [[ "$NO_HIC" -eq 0 ]]; }
+}
+
+validate_cool_file() {
+  local path="$1"
+  [[ -s "$path" ]] || return 1
+  cooler info "$path" >/dev/null 2>&1
+}
+
+validate_mcool_file() {
+  local path="$1"
+  [[ -s "$path" ]] || return 1
+  cooler ls "$path" >/dev/null 2>&1
+}
+
+validate_hic_file() {
+  local path="$1"
+  [[ -s "$path" ]]
+}
+
+write_matrix_metadata() {
+  local done_file="${STATUS_DIR}/pipeline.done"
+  local tmp_file="${done_file}.tmp"
+  if [[ -s "$done_file" ]]; then
+    grep -Ev '^(cool|mcool|hic)[[:space:]]' "$done_file" > "$tmp_file" || true
+  else
+    : > "$tmp_file"
+  fi
+  {
+    if cool_enabled; then
+      printf 'cool\t%s\n' "$COOL_FILE"
+      printf 'mcool\t%s\n' "$MCOOL_FILE"
+    fi
+    if hic_enabled; then
+      printf 'hic\t%s\n' "$HIC_FILE"
+    fi
+  } >> "$tmp_file"
+  mv "$tmp_file" "$done_file"
+}
+
+run_cool_step() {
+  if validate_cool_file "$COOL_FILE"; then
+    progress_msg "cool matrix already complete: ${COOL_FILE}"
+    atomic_set_status "$COOL_STATUS" "done"
+    return
+  fi
+  if [[ -e "$COOL_FILE" ]]; then
+    progress_msg "existing .cool failed validation; deleting .cool and downstream .mcool"
+    rm -f "$COOL_FILE" "$MCOOL_FILE"
+    atomic_set_status "$MCOOL_STATUS" "null"
+  fi
+  local log_file="${LOG_DIR}/cool.log"
+  local cmd_text="cooler cload pairix -p ${THREADS} ${CHROM_SIZES}:${COOL_BASE_RES} ${VALID_PAIRS} ${COOL_FILE}"
+  atomic_set_status "$COOL_STATUS" "running"
+  CURRENT_STATUS_FILE="$COOL_STATUS"
+  write_step_log_header "$log_file" "$cmd_text" "$COOL_FILE"
+  set +e
+  cooler cload pairix -p "$THREADS" "${CHROM_SIZES}:${COOL_BASE_RES}" "$VALID_PAIRS" "$COOL_FILE" >> "$log_file" 2>&1
+  local exit_code=$?
+  set -e
+  write_step_log_footer "$log_file" "$exit_code"
+  CURRENT_STATUS_FILE=""
+  if [[ "$exit_code" -eq 0 ]] && validate_cool_file "$COOL_FILE"; then
+    atomic_set_status "$COOL_STATUS" "done"
+  else
+    atomic_set_status "$COOL_STATUS" "failed"
+    atomic_set_status "$MATRIX_STATUS" "failed"
+    die ".cool generation failed"
+  fi
+}
+
+run_mcool_step() {
+  if validate_mcool_file "$MCOOL_FILE"; then
+    progress_msg "mcool matrix already complete: ${MCOOL_FILE}"
+    atomic_set_status "$MCOOL_STATUS" "done"
+    return
+  fi
+  if [[ -e "$MCOOL_FILE" ]]; then
+    progress_msg "existing .mcool failed validation; deleting .mcool"
+    rm -f "$MCOOL_FILE"
+  fi
+  local log_file="${LOG_DIR}/mcool.log"
+  local cmd_text="cooler zoomify -p ${THREADS} --balance -r ${MCOOL_RESOLUTIONS} -o ${MCOOL_FILE} ${COOL_FILE}"
+  atomic_set_status "$MCOOL_STATUS" "running"
+  CURRENT_STATUS_FILE="$MCOOL_STATUS"
+  write_step_log_header "$log_file" "$cmd_text" "$MCOOL_FILE"
+  set +e
+  cooler zoomify -p "$THREADS" --balance -r "$MCOOL_RESOLUTIONS" -o "$MCOOL_FILE" "$COOL_FILE" >> "$log_file" 2>&1
+  local exit_code=$?
+  set -e
+  write_step_log_footer "$log_file" "$exit_code"
+  CURRENT_STATUS_FILE=""
+  if [[ "$exit_code" -eq 0 ]] && validate_mcool_file "$MCOOL_FILE"; then
+    atomic_set_status "$MCOOL_STATUS" "done"
+  else
+    atomic_set_status "$MCOOL_STATUS" "failed"
+    atomic_set_status "$MATRIX_STATUS" "failed"
+    die ".mcool generation failed"
+  fi
+}
+
+run_hic_step() {
+  if validate_hic_file "$HIC_FILE"; then
+    progress_msg "hic matrix already complete: ${HIC_FILE}"
+    atomic_set_status "$HIC_STATUS" "done"
+    return
+  fi
+  if [[ -e "$HIC_FILE" ]]; then
+    progress_msg "existing .hic failed validation; deleting .hic"
+    rm -f "$HIC_FILE"
+  fi
+  local log_file="${LOG_DIR}/hic.log"
+  local cmd_text="juicer_tools pre -j ${THREADS} ${VALID_PAIRS} ${HIC_FILE} ${CHROM_SIZES}"
+  atomic_set_status "$HIC_STATUS" "running"
+  CURRENT_STATUS_FILE="$HIC_STATUS"
+  write_step_log_header "$log_file" "$cmd_text" "$HIC_FILE"
+  set +e
+  juicer_tools pre -j "$THREADS" "$VALID_PAIRS" "$HIC_FILE" "$CHROM_SIZES" >> "$log_file" 2>&1
+  local exit_code=$?
+  set -e
+  write_step_log_footer "$log_file" "$exit_code"
+  CURRENT_STATUS_FILE=""
+  if [[ "$exit_code" -eq 0 ]] && validate_hic_file "$HIC_FILE"; then
+    atomic_set_status "$HIC_STATUS" "done"
+  else
+    atomic_set_status "$HIC_STATUS" "failed"
+    atomic_set_status "$MATRIX_STATUS" "failed"
+    die ".hic generation failed"
+  fi
+}
+
+run_matrix_phase() {
+  matrix_enabled || return
+  valid_pairs_ready || die "Valid pairs and pairix index are required for matrix generation: ${VALID_PAIRS} and ${VALID_PAIRS_INDEX}"
+  prepare_chrom_sizes
+  progress_msg "starting matrix generation"
+  atomic_set_status "$PIPELINE_STATUS" "running"
+  atomic_set_status "$MATRIX_STATUS" "running"
+  if cool_enabled; then
+    run_cool_step
+    run_mcool_step
+  fi
+  if hic_enabled; then
+    run_hic_step
+  fi
+  if { ! cool_enabled || { [[ "$(get_status "$COOL_STATUS")" == "done" ]] && [[ "$(get_status "$MCOOL_STATUS")" == "done" ]]; }; } &&
+     { ! hic_enabled || [[ "$(get_status "$HIC_STATUS")" == "done" ]]; }; then
+    atomic_set_status "$MATRIX_STATUS" "done"
+    atomic_set_status "$PIPELINE_STATUS" "done"
+    write_matrix_metadata
+    progress_msg "matrix generation complete"
+  else
+    atomic_set_status "$MATRIX_STATUS" "failed"
+    die "Matrix generation did not complete"
+  fi
+}
+
 print_status() {
   local total=0 done_count=0 incomplete_count=0
   local trim_incomplete=0 bwa_incomplete=0 parse_incomplete=0 sort_incomplete=0 restrict_incomplete=0 select_incomplete=0
@@ -1320,6 +1546,10 @@ QC: $(get_status "$QC_STATUS")
 Chunk split: $(get_status "$CHUNK_SPLIT_STATUS")
 All chunks: $(get_status "$ALL_CHUNKS_STATUS")
 Final: $(get_status "$FINAL_STATUS")
+Cool: $(get_status "$COOL_STATUS")
+Mcool: $(get_status "$MCOOL_STATUS")
+HiC: $(get_status "$HIC_STATUS")
+Matrix: $(get_status "$MATRIX_STATUS")
 
 Chunks:
   total: ${total}
@@ -1346,6 +1576,9 @@ Sample-level pairs:
 Outputs:
   valid pairs: ${VALID_PAIRS}
   pairix index: ${VALID_PAIRS_INDEX}
+  cool: ${COOL_FILE}
+  mcool: ${MCOOL_FILE}
+  hic: ${HIC_FILE}
 EOF
 }
 
@@ -1412,15 +1645,35 @@ preflight() {
     require_command fastqc
     require_command trim_galore
     require_command bwa
-    require_command samtools
-    require_command cooler
     require_command python3
     [[ -s "$SPLIT_HELPER" ]] || die "FASTQ split helper not found: ${SPLIT_HELPER}"
+  fi
+  if [[ "$SKIP_CHUNKS" -eq 0 ]] || matrix_enabled; then
+    require_command samtools
+  fi
+  if [[ "$SKIP_CHUNKS" -eq 0 ]] || cool_enabled; then
+    require_command cooler
   fi
   require_command pairtools
   require_command pairix
   require_command bgzip
   require_command gzip
+  if hic_enabled; then
+    require_command juicer_tools
+  fi
+}
+
+preflight_matrix_only() {
+  [[ -r "$GENOME_FA" ]] || die "Genome FASTA is missing or unreadable: ${GENOME_FA}"
+  require_command samtools
+  require_command pairix
+  require_command gzip
+  if cool_enabled; then
+    require_command cooler
+  fi
+  if hic_enabled; then
+    require_command juicer_tools
+  fi
 }
 
 parse_args() {
@@ -1446,14 +1699,27 @@ parse_args() {
       --merge-max-nmerge) MERGE_MAX_NMERGE="$2"; shift 2 ;;
       --force-init) FORCE_INIT=1; shift ;;
       --status-only) STATUS_ONLY=1; shift ;;
+      --no-matrix) NO_MATRIX=1; shift ;;
+      --no-cool) NO_COOL=1; shift ;;
+      --no-hic) NO_HIC=1; shift ;;
+      --matrix-only) MATRIX_ONLY=1; shift ;;
+      --cool-base-res) COOL_BASE_RES="$2"; shift 2 ;;
+      --mcool-resolutions) MCOOL_RESOLUTIONS="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) usage >&2; exit 2 ;;
     esac
   done
-  [[ -n "$SAMPLE" && -n "$R1" && -n "$R2" && -n "$GENOME_NAME" && -n "$GENOME_FA" && -n "$ENZYME" && -n "$WORKDIR" && -n "$OUTDIR" ]] || {
-    usage >&2
-    exit 2
-  }
+  if [[ "$MATRIX_ONLY" -eq 1 ]]; then
+    [[ -n "$SAMPLE" && -n "$GENOME_NAME" && -n "$GENOME_FA" && -n "$OUTDIR" ]] || {
+      usage >&2
+      exit 2
+    }
+  else
+    [[ -n "$SAMPLE" && -n "$R1" && -n "$R2" && -n "$GENOME_NAME" && -n "$GENOME_FA" && -n "$ENZYME" && -n "$WORKDIR" && -n "$OUTDIR" ]] || {
+      usage >&2
+      exit 2
+    }
+  fi
   [[ "$THREADS" =~ ^[0-9]+$ && "$THREADS" -gt 0 ]] || die "--threads must be a positive integer"
   [[ "$CHUNK_SIZE" =~ ^[0-9]+$ && "$CHUNK_SIZE" -gt 0 ]] || die "--chunk-size must be a positive integer"
   case "$CHUNK_VALIDATE_MODE" in
@@ -1464,8 +1730,19 @@ parse_args() {
   [[ "$SHORT_CIS_CUTOFF" =~ ^[0-9]+$ ]] || die "--short-cis-cutoff must be a nonnegative integer"
   [[ "$MAX_CHUNKS" =~ ^[0-9]+$ ]] || die "--max-chunks must be a nonnegative integer"
   [[ "$MERGE_MAX_NMERGE" =~ ^[0-9]+$ && "$MERGE_MAX_NMERGE" -gt 0 ]] || die "--merge-max-nmerge must be a positive integer"
+  [[ "$COOL_BASE_RES" =~ ^[0-9]+$ && "$COOL_BASE_RES" -gt 0 ]] || die "--cool-base-res must be a positive integer"
+  [[ "$MCOOL_RESOLUTIONS" =~ ^[0-9]+(,[0-9]+)*$ ]] || die "--mcool-resolutions must be a comma-separated list of positive integers"
   if [[ "$STOP_AFTER_CHUNKS" -eq 1 && "$SKIP_CHUNKS" -eq 1 ]]; then
     die "--stop-after-chunks and --skip-chunks cannot be used together"
+  fi
+  if [[ "$NO_COOL" -eq 1 && "$NO_HIC" -eq 1 ]]; then
+    NO_MATRIX=1
+  fi
+  if [[ "$MATRIX_ONLY" -eq 1 && "$NO_MATRIX" -eq 1 ]]; then
+    die "--matrix-only requires at least one matrix output; do not combine it with --no-matrix or both --no-cool and --no-hic"
+  fi
+  if [[ "$MATRIX_ONLY" -eq 1 && "$STOP_AFTER_CHUNKS" -eq 1 ]]; then
+    die "--matrix-only and --stop-after-chunks cannot be used together"
   fi
 }
 
@@ -1482,8 +1759,33 @@ main() {
   acquire_lock
   init_status
   print_run_summary
+  if [[ "$MATRIX_ONLY" -eq 1 ]]; then
+    preflight_matrix_only
+    atomic_set_status "$PIPELINE_STATUS" "running"
+    prepare_chrom_sizes
+    valid_pairs_ready || die "Matrix-only mode requires existing valid pairs and pairix index: ${VALID_PAIRS} and ${VALID_PAIRS_INDEX}"
+    atomic_set_status "$VALID_PAIRS_STATUS" "done"
+    atomic_set_status "$FINAL_STATUS" "done"
+    run_matrix_phase
+    log_msg "Matrix-only upgrade complete for sample ${SAMPLE}"
+    print_final_summary
+    return
+  fi
   preflight
   atomic_set_status "$PIPELINE_STATUS" "running"
+  if valid_pairs_ready; then
+    progress_msg "valid pairs and pairix index already exist; skipping chunk, merge, dedup, split-pairs, and pairix phases"
+    atomic_set_status "$VALID_PAIRS_STATUS" "done"
+    atomic_set_status "$FINAL_STATUS" "done"
+    if matrix_enabled; then
+      run_matrix_phase
+    else
+      atomic_set_status "$PIPELINE_STATUS" "done"
+    fi
+    log_msg "Pipeline complete for sample ${SAMPLE}"
+    print_final_summary
+    return
+  fi
   if [[ "$SKIP_CHUNKS" -eq 0 ]]; then
     prepare_reference
     run_fastqc
@@ -1494,6 +1796,7 @@ main() {
   fi
   if [[ "$SKIP_CHUNKS" -eq 1 ]]; then
     run_sample_pairs_phase
+    run_matrix_phase
     log_msg "Pipeline complete for sample ${SAMPLE}"
   elif ! check_all_chunks_done; then
     atomic_set_status "$PIPELINE_STATUS" "null"
@@ -1504,6 +1807,7 @@ main() {
     progress_msg "stopped after chunk preprocessing as requested"
   else
     run_sample_pairs_phase
+    run_matrix_phase
     log_msg "Pipeline complete for sample ${SAMPLE}"
   fi
   print_final_summary
