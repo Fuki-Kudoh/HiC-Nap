@@ -63,7 +63,14 @@ Optional arguments:
 --no-hic
 --matrix-only
 --cool-base-res 10000
---mcool-resolutions 10000,25000,50000,100000,250000,500000,1000000
+--mcool-resolutions 10000,50000,100000,250000,500000,1000000
+```
+
+Every `--mcool-resolutions` value must be an integer multiple of `--cool-base-res`. For 25 kb output, use a 5 kb base resolution:
+
+```bash
+--cool-base-res 5000
+--mcool-resolutions 5000,10000,25000,50000,100000,250000,500000,1000000
 ```
 
 Example for a small test run:
