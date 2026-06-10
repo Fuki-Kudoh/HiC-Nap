@@ -2,14 +2,14 @@
 
 HiC-Nap is a conservative, restartable, chunk-based Hi-C preprocessing pipeline for paired-end FASTQ files on a local Linux workstation.
 
-Version 0.2.0 runs chunk-level preprocessing, then globally merges and deduplicates all selected chunk `pairsam.gz` files to produce a BGZF-compressed, pairix-indexed sample-level valid pairs file:
+Version 0.2.x runs chunk-level preprocessing, then globally merges and deduplicates all selected chunk `pairsam.gz` files to produce a BGZF-compressed, pairix-indexed sample-level valid pairs file:
 
 ```text
 outdir/pairs/SAMPLE.valid.pairs.gz
 outdir/pairs/SAMPLE.valid.pairs.gz.px2
 ```
 
-Matrix generation (`.cool`, `.mcool`, and `.hic`) is intentionally left for a later phase.
+Version 0.3.0 adds a restartable matrix-generation phase after valid pairs are complete.
 
 ## Requirements
 
@@ -23,6 +23,7 @@ The pipeline is written as Bash plus a small Python standard-library FASTQ split
 - `pairix`
 - `bgzip`
 - `cooler`
+- `juicer_tools`
 - `gzip`
 - `python3`
 
@@ -57,6 +58,12 @@ Optional arguments:
 --merge-max-nmerge 8
 --force-init
 --status-only
+--no-matrix
+--no-cool
+--no-hic
+--matrix-only
+--cool-base-res 10000
+--mcool-resolutions 10000,25000,50000,100000,250000,500000,1000000
 ```
 
 Example for a small test run:
@@ -119,6 +126,14 @@ outdir/stats/SAMPLE.dedup.stats
 outdir/status/SAMPLE/chunk_pairsam.list
 ```
 
+The v0.3.0 matrix phase then produces:
+
+```text
+outdir/cool/SAMPLE.10000.cool
+outdir/cool/SAMPLE.mcool
+outdir/hic/SAMPLE.hic
+```
+
 ## Resume Behavior
 
 Status files contain exactly one value: `null`, `running`, `done`, or `failed`.
@@ -126,6 +141,8 @@ Status files contain exactly one value: `null`, `running`, `done`, or `failed`.
 A step is complete only when its status is `done` and its expected output validates. On restart, any missing, invalid, `running`, `failed`, or `null` step is rerun conservatively. The script deletes that step’s output and downstream intermediates before rerunning.
 
 In v0.2.0, `pipeline.status = done` means chunk outputs validate and the final valid pairs file plus pairix index exist and validate. Completed chunks alone are not enough for final pipeline completion.
+
+In v0.3.0 default runs, `pipeline.status = done` means valid pairs and enabled matrix outputs validate. Use `--no-matrix` to stop after the v0.2.x valid-pairs phase.
 
 The sample lock is stored at:
 
@@ -209,6 +226,42 @@ If you already processed a sample with HiC-Nap v0.1.x and have completed chunk-l
 ```
 
 This validates the existing `chunk.selected.sorted.pairsam.gz` files and then runs global merge, global deduplication, pairs output, and pairix indexing.
+
+## Matrix Generation
+
+By default, HiC-Nap v0.3.0 runs matrix generation after `outdir/pairs/SAMPLE.valid.pairs.gz` and its `.px2` pairix index validate. If those valid-pairs outputs already exist and validate, the script skips chunk preprocessing, merge, deduplication, split-pairs, and pairix indexing, then proceeds directly to matrix generation.
+
+Matrix generation writes restartable statuses:
+
+```text
+outdir/status/SAMPLE/cool.status
+outdir/status/SAMPLE/mcool.status
+outdir/status/SAMPLE/hic.status
+outdir/status/SAMPLE/matrix.status
+```
+
+The matrix commands are:
+
+```bash
+cooler cload pairix -p THREADS outdir/genome/GENOME.chrom.sizes:COOL_BASE_RES outdir/pairs/SAMPLE.valid.pairs.gz outdir/cool/SAMPLE.COOL_BASE_RES.cool
+cooler zoomify -p THREADS --balance -r MCOOL_RESOLUTIONS -o outdir/cool/SAMPLE.mcool outdir/cool/SAMPLE.COOL_BASE_RES.cool
+juicer_tools pre -j THREADS outdir/pairs/SAMPLE.valid.pairs.gz outdir/hic/SAMPLE.hic outdir/genome/GENOME.chrom.sizes
+```
+
+The `.hic` command uses the `chrom.sizes` path rather than only a genome name, so custom genomes are supported.
+
+To upgrade an existing v0.2.x output directory directly to v0.3.0 matrices:
+
+```bash
+./hic_chunk_pipeline.sh \
+  --sample SAMPLE \
+  --genome-name GENOME \
+  --genome-fa GENOME.fa \
+  --outdir OUTDIR \
+  --matrix-only
+```
+
+Matrix-only mode requires existing valid pairs and pairix index outputs, creates or validates `outdir/genome/GENOME.chrom.sizes` from `GENOME.fa.fai`, and does not require R1, R2, enzyme, workdir, a restriction digest, or a BWA index.
 
 ## Progress Output
 
