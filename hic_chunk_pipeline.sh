@@ -26,7 +26,7 @@ NO_COOL=0
 NO_HIC=0
 MATRIX_ONLY=0
 COOL_BASE_RES=10000
-MCOOL_RESOLUTIONS="10000,25000,50000,100000,250000,500000,1000000"
+MCOOL_RESOLUTIONS="10000,50000,100000,250000,500000,1000000"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPLIT_HELPER="${SCRIPT_DIR}/split_pe_fastq.py"
@@ -71,7 +71,7 @@ Optional:
   --no-hic
   --matrix-only
   --cool-base-res 10000
-  --mcool-resolutions 10000,25000,50000,100000,250000,500000,1000000
+  --mcool-resolutions 10000,50000,100000,250000,500000,1000000
 
 Matrix-only upgrade from v0.2.x outputs:
   ./hic_chunk_pipeline.sh \
@@ -1732,6 +1732,10 @@ parse_args() {
   [[ "$MERGE_MAX_NMERGE" =~ ^[0-9]+$ && "$MERGE_MAX_NMERGE" -gt 0 ]] || die "--merge-max-nmerge must be a positive integer"
   [[ "$COOL_BASE_RES" =~ ^[0-9]+$ && "$COOL_BASE_RES" -gt 0 ]] || die "--cool-base-res must be a positive integer"
   [[ "$MCOOL_RESOLUTIONS" =~ ^[0-9]+(,[0-9]+)*$ ]] || die "--mcool-resolutions must be a comma-separated list of positive integers"
+  local resolution
+  while IFS= read -r resolution; do
+    (( resolution % COOL_BASE_RES == 0 )) || die "--mcool-resolutions value ${resolution} must be an integer multiple of --cool-base-res ${COOL_BASE_RES}"
+  done < <(tr ',' '\n' <<< "$MCOOL_RESOLUTIONS")
   if [[ "$STOP_AFTER_CHUNKS" -eq 1 && "$SKIP_CHUNKS" -eq 1 ]]; then
     die "--stop-after-chunks and --skip-chunks cannot be used together"
   fi

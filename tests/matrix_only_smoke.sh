@@ -34,6 +34,7 @@ case "${1:-}" in
     printf 'cool\n' > "$out"
     ;;
   zoomify)
+    printf '%s\n' "$*" >> "${COOLER_LOG:?}"
     out=""
     while [[ $# -gt 0 ]]; do
       if [[ "$1" == "-o" ]]; then
@@ -93,7 +94,7 @@ printf 'pairix-index\n' > "${OUTDIR}/pairs/TINY.valid.pairs.gz.px2"
 cp "${OUTDIR}/pairs/TINY.valid.pairs.gz" "${NO_HIC_OUTDIR}/pairs/TINY.valid.pairs.gz"
 cp "${OUTDIR}/pairs/TINY.valid.pairs.gz.px2" "${NO_HIC_OUTDIR}/pairs/TINY.valid.pairs.gz.px2"
 
-PATH="${BIN_DIR}:${PATH}" "${REPO_ROOT}/hic_chunk_pipeline.sh" \
+COOLER_LOG="${TMPDIR}/cooler.log" PATH="${BIN_DIR}:${PATH}" "${REPO_ROOT}/hic_chunk_pipeline.sh" \
   --sample TINY \
   --genome-name tiny \
   --genome-fa "$GENOME_FA" \
@@ -108,8 +109,9 @@ grep -q '^done$' "${OUTDIR}/status/TINY/matrix.status"
 grep -q '^cool	' "${OUTDIR}/status/TINY/pipeline.done"
 grep -q '^mcool	' "${OUTDIR}/status/TINY/pipeline.done"
 grep -q '^hic	' "${OUTDIR}/status/TINY/pipeline.done"
+grep -q -- '-r 10000,50000,100000,250000,500000,1000000' "${TMPDIR}/cooler.log"
 
-PATH="${BIN_DIR}:${PATH}" "${REPO_ROOT}/hic_chunk_pipeline.sh" \
+COOLER_LOG="${TMPDIR}/cooler.log" PATH="${BIN_DIR}:${PATH}" "${REPO_ROOT}/hic_chunk_pipeline.sh" \
   --sample TINY \
   --genome-name tiny \
   --genome-fa "$GENOME_FA" \
@@ -125,3 +127,19 @@ grep -q '^done$' "${NO_HIC_OUTDIR}/status/TINY/matrix.status"
 grep -q '^cool	' "${NO_HIC_OUTDIR}/status/TINY/pipeline.done"
 grep -q '^mcool	' "${NO_HIC_OUTDIR}/status/TINY/pipeline.done"
 ! grep -q '^hic	' "${NO_HIC_OUTDIR}/status/TINY/pipeline.done"
+
+INVALID_ERR="${TMPDIR}/invalid-resolutions.err"
+if PATH="${BIN_DIR}:${PATH}" "${REPO_ROOT}/hic_chunk_pipeline.sh" \
+  --sample TINY \
+  --genome-name tiny \
+  --genome-fa "$GENOME_FA" \
+  --outdir "${TMPDIR}/out-invalid" \
+  --matrix-only \
+  --cool-base-res 10000 \
+  --mcool-resolutions 10000,25000 \
+  2> "$INVALID_ERR"; then
+  printf 'expected incompatible mcool resolutions to fail validation\n' >&2
+  exit 1
+fi
+grep -q -- '--mcool-resolutions value 25000 must be an integer multiple of --cool-base-res 10000' "$INVALID_ERR"
+[[ ! -e "${TMPDIR}/out-invalid" ]]
