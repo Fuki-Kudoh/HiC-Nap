@@ -1,5 +1,7 @@
 # HiC-Nap
-
+<p align="center">
+  <img src="assets/HiC-Nap_logo.png" alt="HiC-Nap logo" width="500">
+</p>
 HiC-Nap is a conservative, restartable, chunk-based Hi-C preprocessing pipeline for paired-end FASTQ files on a local Linux workstation.
 
 Version 0.2.x runs chunk-level preprocessing, then globally merges and deduplicates all selected chunk `pairsam.gz` files to produce a BGZF-compressed, pairix-indexed sample-level valid pairs file:
